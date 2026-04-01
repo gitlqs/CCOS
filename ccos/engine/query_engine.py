@@ -252,33 +252,44 @@ class QueryEngine:
             thinking=self.thinking,
         )
 
-        async for chunk in stream:
-            if chunk.type == ChunkType.TEXT:
-                if chunk.text:
-                    current_text += chunk.text
-                    if self._on_text:
-                        self._on_text(chunk.text)
+        try:
+            async for chunk in stream:
+                if chunk.type == ChunkType.TEXT:
+                    if chunk.text:
+                        current_text += chunk.text
+                        if self._on_text:
+                            self._on_text(chunk.text)
 
-            elif chunk.type == ChunkType.THINKING:
-                if chunk.text and self._on_thinking:
-                    self._on_thinking(chunk.text)
+                elif chunk.type == ChunkType.THINKING:
+                    if chunk.text and self._on_thinking:
+                        self._on_thinking(chunk.text)
 
-            elif chunk.type == ChunkType.TOOL_CALL_START:
-                current_tool = chunk.tool_call
+                elif chunk.type == ChunkType.TOOL_CALL_START:
+                    current_tool = chunk.tool_call
 
-            elif chunk.type == ChunkType.TOOL_CALL_END:
-                if chunk.tool_call:
-                    response.content.append(chunk.tool_call)
+                elif chunk.type == ChunkType.TOOL_CALL_END:
+                    if chunk.tool_call:
+                        response.content.append(chunk.tool_call)
 
-            elif chunk.type == ChunkType.DONE:
-                response.stop_reason = chunk.stop_reason or "end_turn"
-                response.input_tokens = chunk.input_tokens
-                response.output_tokens = chunk.output_tokens
-                response.cache_read_tokens = chunk.cache_read_tokens
-                response.cache_creation_tokens = chunk.cache_creation_tokens
+                elif chunk.type == ChunkType.DONE:
+                    response.stop_reason = chunk.stop_reason or "end_turn"
+                    response.input_tokens = chunk.input_tokens
+                    response.output_tokens = chunk.output_tokens
+                    response.cache_read_tokens = chunk.cache_read_tokens
+                    response.cache_creation_tokens = chunk.cache_creation_tokens
 
-            elif chunk.type == ChunkType.ERROR:
-                current_text += f"\n\n[Error: {chunk.text}]"
+                elif chunk.type == ChunkType.ERROR:
+                    current_text += f"\n\n[Error: {chunk.text}]"
+        finally:
+            # Ensure the async generator is properly closed to avoid
+            # "Task was destroyed but it is pending!" warnings.
+            # This happens when the generator's underlying HTTP stream
+            # hasn't been fully consumed (e.g., after permission deny).
+            if hasattr(stream, 'aclose'):
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
 
         # Add accumulated text as content block
         if current_text:

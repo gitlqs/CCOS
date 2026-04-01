@@ -185,7 +185,31 @@ class App:
 
     def _run_async(self, coro) -> Any:
         """Run a coroutine on the persistent event loop."""
-        return self._get_loop().run_until_complete(coro)
+        loop = self._get_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            # Clean up any leftover async-generator finalization tasks
+            # immediately, so they don't trigger "Task was destroyed but
+            # it is pending!" warnings between turns.
+            self._drain_pending_tasks(loop)
+
+    @staticmethod
+    def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+        """Cancel and drain stale tasks (e.g., async-generator athrow)."""
+        try:
+            pending = [
+                t for t in asyncio.all_tasks(loop)
+                if not t.done() and "athrow" in repr(t.get_coro())
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        except Exception:
+            pass
 
     def _shutdown_loop(self) -> None:
         """Shut down MCP transports then close the event loop."""
