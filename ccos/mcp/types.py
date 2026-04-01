@@ -65,7 +65,7 @@ class MCPServerConfig:
         return cls(
             type=transport,
             command=d.get("command", ""),
-            args=d.get("args", []),
+            args=d.get("args", []) if isinstance(d.get("args"), list) else [d["args"]] if d.get("args") else [],
             env=d.get("env", {}),
             cwd=d.get("cwd", ""),
             url=d.get("url", ""),

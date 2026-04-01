@@ -115,5 +115,5 @@ def _mode_symbol(mode: str) -> Text:
     elif mode == "plan":
         t.append("●", style="bold blue")  # plan mode
     else:
-        t.append("●", style="rgb(215,119,87)")  # default = Claude orange
+        t.append("●", style="rgb(0,200,180)")  # default = CCOS teal
     return t

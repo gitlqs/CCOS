@@ -1,4 +1,4 @@
-"""Color themes matching Claude Code's exact palette."""
+"""CCOS color themes."""
 
 from __future__ import annotations
 
@@ -13,31 +13,31 @@ class ThemeColors:
     """Complete color palette for one theme."""
 
     # Brand
-    claude: str  # Claude orange — header text, accents
-    clawd_body: str  # Clawd mascot body
-    clawd_background: str  # Clawd eye background
+    brand: str       # CCOS brand accent — header text, highlights
+    mascot: str      # Mascot body color
+    mascot_bg: str   # Mascot detail background
 
     # UI chrome
     bash_border: str  # Bash mode accent
-    suggestion: str  # Autocomplete suggestion
+    suggestion: str   # Autocomplete suggestion
     success: str
     error: str
     warning: str
-    inactive: str  # Disabled / secondary text
-    subtle: str  # Very faint text
-    text: str  # Primary text
+    inactive: str     # Disabled / secondary text
+    subtle: str       # Very faint text
+    text: str         # Primary text
 
     # Permission mode colors
     mode_default: str  # Default (confirm) mode
-    mode_auto: str  # Auto-accept mode
-    mode_plan: str  # Plan mode
+    mode_auto: str     # Auto-accept mode
+    mode_plan: str     # Plan mode
 
 
 # ── Dark theme (RGB) ─────────────────────────────────────────────────
 DARK = ThemeColors(
-    claude="rgb(215,119,87)",
-    clawd_body="rgb(215,119,87)",
-    clawd_background="rgb(0,0,0)",
+    brand="rgb(0,200,180)",       # Teal
+    mascot="rgb(0,200,180)",
+    mascot_bg="rgb(0,0,0)",
     bash_border="rgb(255,0,135)",
     suggestion="rgb(87,105,247)",
     success="rgb(44,187,93)",
@@ -46,16 +46,16 @@ DARK = ThemeColors(
     inactive="rgb(102,102,102)",
     subtle="rgb(175,175,175)",
     text="rgb(255,255,255)",
-    mode_default="rgb(215,119,87)",
+    mode_default="rgb(0,200,180)",
     mode_auto="rgb(44,187,93)",
     mode_plan="rgb(87,105,247)",
 )
 
 # ── Light theme (RGB) ────────────────────────────────────────────────
 LIGHT = ThemeColors(
-    claude="rgb(215,119,87)",
-    clawd_body="rgb(215,119,87)",
-    clawd_background="rgb(0,0,0)",
+    brand="rgb(0,150,140)",
+    mascot="rgb(0,150,140)",
+    mascot_bg="rgb(255,255,255)",
     bash_border="rgb(255,0,135)",
     suggestion="rgb(87,105,247)",
     success="rgb(44,122,57)",
@@ -64,16 +64,16 @@ LIGHT = ThemeColors(
     inactive="rgb(102,102,102)",
     subtle="rgb(175,175,175)",
     text="rgb(0,0,0)",
-    mode_default="rgb(215,119,87)",
+    mode_default="rgb(0,150,140)",
     mode_auto="rgb(44,122,57)",
     mode_plan="rgb(87,105,247)",
 )
 
 # ── ANSI fallbacks (16-color safe) ───────────────────────────────────
 DARK_ANSI = ThemeColors(
-    claude="bright_red",
-    clawd_body="bright_red",
-    clawd_background="black",
+    brand="cyan",
+    mascot="cyan",
+    mascot_bg="black",
     bash_border="magenta",
     suggestion="blue",
     success="green",
@@ -82,15 +82,15 @@ DARK_ANSI = ThemeColors(
     inactive="bright_black",
     subtle="bright_black",
     text="white",
-    mode_default="bright_red",
+    mode_default="cyan",
     mode_auto="green",
     mode_plan="blue",
 )
 
 LIGHT_ANSI = ThemeColors(
-    claude="bright_red",
-    clawd_body="bright_red",
-    clawd_background="black",
+    brand="cyan",
+    mascot="cyan",
+    mascot_bg="white",
     bash_border="magenta",
     suggestion="blue",
     success="green",
@@ -99,7 +99,7 @@ LIGHT_ANSI = ThemeColors(
     inactive="bright_black",
     subtle="bright_black",
     text="black",
-    mode_default="bright_red",
+    mode_default="cyan",
     mode_auto="green",
     mode_plan="blue",
 )

@@ -244,7 +244,10 @@ class MCPConnection:
     # -- Internal fetchers ---------------------------------------------------
 
     async def _fetch_tools(self) -> None:
-        result = await self._send_request("tools/list", {})
+        try:
+            result = await self._send_request("tools/list", {})
+        except RuntimeError:
+            return
         if result and isinstance(result, dict):
             self._tools = [
                 MCPToolDef(
@@ -257,7 +260,10 @@ class MCPConnection:
             ]
 
     async def _fetch_resources(self) -> None:
-        result = await self._send_request("resources/list", {})
+        try:
+            result = await self._send_request("resources/list", {})
+        except RuntimeError:
+            return  # Server doesn't support resources — that's fine
         if result and isinstance(result, dict):
             self._resources = [
                 MCPResource(
@@ -271,7 +277,10 @@ class MCPConnection:
             ]
 
     async def _fetch_prompts(self) -> None:
-        result = await self._send_request("prompts/list", {})
+        try:
+            result = await self._send_request("prompts/list", {})
+        except RuntimeError:
+            return  # Server doesn't support prompts — that's fine
         if result and isinstance(result, dict):
             self._prompts = [
                 MCPPrompt(

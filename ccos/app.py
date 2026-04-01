@@ -70,10 +70,18 @@ class App:
         # Session manager
         self.session_manager = SessionManager()
 
-        # MCP servers — connect and register tools
+        # UI (must be before _init_mcp which uses self.console)
+        self.console = Console()
+        self.renderer = Renderer(self.console)
+        self.status_bar = StatusBar(self.console)
+        self._prompt_mode: PromptMode = "default"
+
+        # MCP servers — deferred to first async context (see _ensure_mcp)
         self.mcp_manager = None
-        if self.config.mcp_servers:
-            self._init_mcp()
+        self._mcp_initialized = False
+
+        # Persistent event loop for MCP transport compatibility
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Wire AgentTool's engine factory
         agent_tool = self.tool_registry.get("Agent")
@@ -106,12 +114,6 @@ class App:
         if self.config.hooks:
             self.hooks.load_from_config(self.config.hooks)
 
-        # UI
-        self.console = Console()
-        self.renderer = Renderer(self.console)
-        self.status_bar = StatusBar(self.console)
-        self._prompt_mode: PromptMode = "default"
-
         # Engine
         self.engine = QueryEngine(
             provider=self.provider,
@@ -138,6 +140,50 @@ class App:
 
         # Resume session if requested
         self._resume_session_id = resume_session_id
+
+    def _get_loop(self) -> asyncio.AbstractEventLoop:
+        """Return a persistent event loop (created once, reused across turns).
+
+        Using a persistent loop is essential when MCP stdio transports are
+        active: their background reader tasks and Futures are bound to the
+        loop that created them.  ``asyncio.run()`` destroys its loop after
+        every call, which orphans those tasks and hangs on executor shutdown.
+        """
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+        return self._loop
+
+    def _run_async(self, coro) -> Any:
+        """Run a coroutine on the persistent event loop."""
+        return self._get_loop().run_until_complete(coro)
+
+    def _shutdown_loop(self) -> None:
+        """Shut down MCP transports then close the event loop."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        # Disconnect MCP servers so their subprocesses + reader tasks stop
+        if self.mcp_manager is not None:
+            try:
+                loop.run_until_complete(self.mcp_manager.disconnect_all())
+            except Exception:
+                pass
+        try:
+            # Cancel any remaining tasks
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
+        self._loop = None
 
     def run_interactive(self) -> None:
         """Run the interactive REPL."""
@@ -174,56 +220,59 @@ class App:
             vim_mode=self.config.ui.vim_mode,
         )
 
-        while True:
-            try:
-                # Update prompt mode based on plan manager state
-                if self.plan_manager.is_plan_mode:
-                    self._prompt_mode = "plan"
-                else:
-                    self._prompt_mode = "default"
-
-                user_input = get_user_input(session, mode=self._prompt_mode)
-
-                if user_input is None:
-                    # Ctrl+D — exit
-                    self.renderer.print_status("Goodbye!")
-                    self.status_bar.render(
-                        model=self.model,
-                        provider=self.provider.name,
-                        cost_tracker=self.engine.cost,
-                        cwd=self.cwd,
-                    )
-                    break
-
-                if not user_input:
-                    continue
-
-                # Check for slash commands
-                if user_input.startswith("/"):
-                    self._handle_slash_command(user_input)
-                    continue
-
-                # Persist user message
-                self.session_manager.save_user_message(user_input)
-
-                # Run through the engine
+        try:
+            while True:
                 try:
-                    result = asyncio.run(self.engine.run_turn(user_input))
-                    self.renderer.flush_streaming()
-                    # Persist assistant response
-                    self._persist_last_assistant()
-                    # Background memory extraction
-                    self._maybe_extract_memories()
-                except KeyboardInterrupt:
-                    self.renderer.flush_streaming()
-                    self.renderer.print_status("Interrupted.")
-                    continue
+                    # Update prompt mode based on plan manager state
+                    if self.plan_manager.is_plan_mode:
+                        self._prompt_mode = "plan"
+                    else:
+                        self._prompt_mode = "default"
 
-            except KeyboardInterrupt:
-                self.console.print()
-                continue
-            except EOFError:
-                break
+                    user_input = get_user_input(session, mode=self._prompt_mode)
+
+                    if user_input is None:
+                        # Ctrl+D — exit
+                        self.renderer.print_status("Goodbye!")
+                        self.status_bar.render(
+                            model=self.model,
+                            provider=self.provider.name,
+                            cost_tracker=self.engine.cost,
+                            cwd=self.cwd,
+                        )
+                        break
+
+                    if not user_input:
+                        continue
+
+                    # Check for slash commands
+                    if user_input.startswith("/"):
+                        self._handle_slash_command(user_input)
+                        continue
+
+                    # Persist user message
+                    self.session_manager.save_user_message(user_input)
+
+                    # Run through the engine
+                    try:
+                        result = self._run_async(self._async_turn(user_input))
+                        self.renderer.flush_streaming()
+                        # Persist assistant response
+                        self._persist_last_assistant()
+                        # Background memory extraction
+                        self._maybe_extract_memories()
+                    except KeyboardInterrupt:
+                        self.renderer.flush_streaming()
+                        self.renderer.print_status("Interrupted.")
+                        continue
+
+                except KeyboardInterrupt:
+                    self.console.print()
+                    continue
+                except EOFError:
+                    break
+        finally:
+            self._shutdown_loop()
 
         self.status_bar.render(
             model=self.model,
@@ -238,12 +287,14 @@ class App:
         self.session_manager.save_user_message(prompt)
 
         try:
-            result = asyncio.run(self.engine.run_turn(prompt))
+            result = self._run_async(self._async_turn(prompt))
             self.renderer.flush_streaming()
             self._persist_last_assistant()
         except KeyboardInterrupt:
             self.renderer.flush_streaming()
             self.renderer.print_status("Interrupted.")
+        finally:
+            self._shutdown_loop()
 
         self.status_bar.render(
             model=self.model,
@@ -252,43 +303,58 @@ class App:
             cwd=self.cwd,
         )
 
-    def _init_mcp(self) -> None:
-        """Initialize MCP server connections and register their tools."""
+    async def _ensure_mcp(self) -> None:
+        """Lazily connect MCP servers on the first async call.
+
+        Must run inside the same event loop that will later call tools,
+        because StdioTransport's background reader task and Futures are
+        bound to the current loop.
+        """
+        if self._mcp_initialized or not self.config.mcp_servers:
+            return
+        self._mcp_initialized = True
+
         try:
             from ccos.mcp.client import MCPManager
             from ccos.mcp.tools import register_mcp_tools
 
             self.mcp_manager = MCPManager()
-            if not self.config.mcp_servers:
+
+            try:
+                results = await asyncio.wait_for(
+                    self.mcp_manager.connect_servers(self.config.mcp_servers),
+                    timeout=15,
+                )
+            except asyncio.TimeoutError:
+                self.console.print("  [dim]MCP connection timed out after 15s[/dim]")
                 return
 
-            results = asyncio.run(
-                self.mcp_manager.connect_servers(self.config.mcp_servers)
-            )
             for name, error in results.items():
                 conn = self.mcp_manager.get_connection(name)
                 if error:
                     self.console.print(f"  [dim]MCP [red]{name}[/red]: {error}[/dim]")
                 elif conn:
-                    tools_count = len(conn.tools)
-                    resources_count = len(conn.resources)
-                    prompts_count = len(conn.prompts)
                     parts = []
-                    if tools_count:
-                        parts.append(f"{tools_count} tools")
-                    if resources_count:
-                        parts.append(f"{resources_count} resources")
-                    if prompts_count:
-                        parts.append(f"{prompts_count} prompts")
+                    if conn.tools:
+                        parts.append(f"{len(conn.tools)} tools")
+                    if conn.resources:
+                        parts.append(f"{len(conn.resources)} resources")
+                    if conn.prompts:
+                        parts.append(f"{len(conn.prompts)} prompts")
                     summary = ", ".join(parts) if parts else "connected"
                     self.console.print(
                         f"  [dim]MCP [green]{name}[/green] ({conn.config.type.value}): {summary}[/dim]"
                     )
 
             # Register all MCP tools
-            registered = register_mcp_tools(self.mcp_manager, self.tool_registry)
+            register_mcp_tools(self.mcp_manager, self.tool_registry)
         except Exception as e:
             self.console.print(f"  [dim]MCP init error: {e}[/dim]")
+
+    async def _async_turn(self, user_input: str) -> str:
+        """Connect MCP (if needed) then run an engine turn in one event loop."""
+        await self._ensure_mcp()
+        return await self.engine.run_turn(user_input)
 
     def _persist_last_assistant(self) -> None:
         """Save the last assistant message to the session transcript."""

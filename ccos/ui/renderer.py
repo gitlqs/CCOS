@@ -33,8 +33,7 @@ _THEME = Theme({
     "status": "dim",
     "cost": "dim green",
     "thinking": "dim italic magenta",
-    "claude": "rgb(215,119,87)",
-    "clawd_body": "rgb(215,119,87)",
+    "brand": "rgb(0,200,180)",
     "dim": "dim",
 })
 
@@ -61,146 +60,115 @@ _TOOL_ICONS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Welcome banner — exact Claude Code dark-theme ASCII art (58 cols wide)
+# Welcome banner — original CCOS circuit-robot design (ASCII safe)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _build_welcome_dark(version: str, colors: ThemeColors) -> Text:
-    """Build the dark-theme welcome banner matching WelcomeV2.tsx."""
-    # CC dark theme banner — each line is 58 chars wide
-    # Colors: claude (orange) for header + clawd body, dim for shading, bold for * accents
+    """Build the dark-theme CCOS welcome banner."""
     t = Text()
-    c = Style(color=colors.claude)        # Claude orange
-    d = Style(dim=True)                    # dim (shading)
-    b = Style(bold=True)                   # bold * accents
-    cb = Style(color=colors.clawd_body)    # clawd body
-    cb_bg = Style(color=colors.clawd_body, bgcolor=colors.clawd_background)  # eyes
+    br = Style(color=colors.brand, bold=True)      # brand teal bold
+    bl = Style(color=colors.brand)                  # brand teal
+    m  = Style(color=colors.mascot)                 # mascot
+    me = Style(color=colors.mascot, bold=True)      # mascot eyes
+    d  = Style(dim=True)                            # dim
+    di = Style(dim=True, italic=True)               # dim italic
+    W  = 58
 
-    # Line 1: Welcome to Claude Code v{version}
-    t.append("Welcome to Claude Code", style=c)
-    t.append(f" v{version} ", style=d)
+    # ── Header box ──────────────────────────────────────────────
     t.append("\n")
+    t.append("    ", style=d)
+    t.append("CCOS", style=br)
+    t.append(f" v{version}", style=d)
+    t.append("\n")
+    t.append("    " + "=" * 54 + "\n", style=bl)
 
-    # Line 2: ellipsis separator (58 × …)
-    t.append(ELLIPSIS * 58 + "\n")
+    # ── Circuit traces (left) + robot head (right) ─────────────
+    #
+    #  Layout grid: 55 chars wide
+    #  Cols 0-30: circuit traces    Cols 31-54: robot
+    #
 
-    # Line 3: empty
-    t.append(" " * 58 + "\n")
+    #  col: 0    5    0    5    0    5    0    5    0    5    0
+    #       |              circuit            | robot head    |
+    #       0         1         2         3    3    4    4    5
+    #       0         0         0         0    1    0    5    0
 
-    # Line 4:      *                                       █████▓▓░
-    t.append("     ")
-    t.append("*", style=b)
-    t.append("                                       █████▓▓░     \n")
+    # Row 1: robot top
+    t.append("                               ", style=d)
+    t.append("+---+-------+---+\n", style=m)
 
-    # Line 5:                                  *         ███▓░     ░░
-    t.append("                                 ")
-    t.append("*", style=b)
-    t.append("         ███▓░     ░░   \n")
+    # Row 2: horizontal bus + robot eyes
+    t.append("    =====+====                 ", style=bl)
+    t.append("|   ", style=m)
+    t.append("(o)", style=me)
+    t.append("   ", style=d)
+    t.append("(o)", style=me)
+    t.append("   |\n", style=m)
 
-    # Line 6:             ░░░░░░                        ███▓░
-    t.append("            ░░░░░░                        ███▓░           \n")
+    # Row 3: vertical trace + robot mouth bar
+    t.append("         |                     ", style=bl)
+    t.append("|     =====     |\n", style=m)
 
-    # Line 7:     ░░░   ░░░░░░░░░░                      ███▓░
-    t.append("    ░░░   ░░░░░░░░░░                      ███▓░           \n")
+    # Row 4: trace bends into robot + smile
+    t.append("    +====+====================", style=bl)
+    t.append("=|    \\_____/    |\n", style=m)
 
-    # Line 8:    ░░░░░░░░░░░░░░░░░░░    *                ██▓░░      ▓
-    t.append("   ░░░░░░░░░░░░░░░░░░░    ")
-    t.append("*", style=b)
-    t.append("                ██▓░░      ▓   \n")
+    # Row 5: vertical trace + robot chin
+    t.append("    |                          ", style=bl)
+    t.append("+-+-----------+-+\n", style=m)
 
-    # Line 9:                                              ░▓▓███▓▓░
-    t.append("                                             ░▓▓███▓▓░    \n")
+    # Row 6: trace branch + info box top + robot neck
+    t.append("    +=+    ...................", style=bl)
+    t.append("  |     |     |\n", style=m)
 
-    # Line 10: *                                 ░░░░
-    t.append(" ", style=d)
-    t.append("*", style=d)
-    t.append("                                 ░░░░                   \n", style=d)
+    # Row 7: info line 1
+    t.append("    | |    ", style=bl)
+    t.append(":", style=d)
+    t.append(" Multi-Provider ", style=di)
+    t.append(":", style=d)
+    t.append("  |  ", style=m)
+    t.append("##", style=me)
+    t.append("  |  ", style=m)
+    t.append("##", style=me)
+    t.append("  |\n", style=m)
 
-    # Line 11:                                  ░░░░░░░░
-    t.append("                                 ░░░░░░░░                 \n", style=d)
+    # Row 8: info line 2 + trace connects to robot body
+    t.append("    | +====", style=bl)
+    t.append(":", style=d)
+    t.append(" Agentic  CLI  ", style=di)
+    t.append(":", style=d)
+    t.append("==", style=bl)
+    t.append("|     |     |\n", style=m)
 
-    # Line 12:                                ░░░░░░░░░░░░░░░░
-    t.append("                               ░░░░░░░░░░░░░░░░           \n", style=d)
+    # Row 9: info line 3
+    t.append("    |      ", style=bl)
+    t.append(":", style=d)
+    t.append(" Code  Engine  ", style=di)
+    t.append(":", style=d)
+    t.append("  |  ", style=m)
+    t.append("##", style=me)
+    t.append("  |  ", style=m)
+    t.append("##", style=me)
+    t.append("  |\n", style=m)
 
-    # Line 13: clawd body row 1:       █████████
-    t.append("      ")
-    t.append(" █████████ ", style=cb)
-    t.append("                                       ")
-    t.append("*", style=d)
-    t.append(" \n")
+    # Row 10: bottom trace + info box bottom + robot body
+    t.append("    +=======", style=bl)
+    t.append("...................", style=d)
+    t.append("==", style=bl)
+    t.append("|     |     |\n", style=m)
 
-    # Line 14: clawd eyes row:       ██▄█████▄██
-    t.append("      ")
-    t.append("██▄█████▄██", style=cb_bg)
-    t.append("                        ")
-    t.append("*", style=b)
-    t.append("                \n")
+    # Row 11: robot feet
+    t.append("                               ", style=d)
+    t.append("+-----+-----+\n", style=m)
 
-    # Line 15: clawd body row 2:       █████████
-    t.append("      ")
-    t.append(" █████████ ", style=cb)
-    t.append("     ")
-    t.append("*", style=b)
-    t.append("                                   \n")
-
-    # Line 16: footer with clawd feet
-    t.append(ELLIPSIS * 7)
-    t.append("█ █   █ █", style=cb)
-    t.append(ELLIPSIS * 42 + "\n")
+    t.append("\n")
 
     return t
 
 
 def _build_welcome_light(version: str, colors: ThemeColors) -> Text:
-    """Build the light-theme welcome banner matching WelcomeV2.tsx."""
-    t = Text()
-    c = Style(color=colors.claude)
-    d = Style(dim=True)
-    cb = Style(color=colors.clawd_body)
-    cb_bg = Style(color=colors.clawd_body, bgcolor=colors.clawd_background)
-
-    # Header
-    t.append("Welcome to Claude Code", style=c)
-    t.append(f" v{version} ", style=d)
-    t.append("\n")
-    t.append(ELLIPSIS * 58 + "\n")
-    t.append(" " * 58 + "\n")
-    t.append(" " * 58 + "\n")
-    t.append(" " * 58 + "\n")
-
-    # Light theme uses only left-side shading
-    t.append("            ░░░░░░                                        \n")
-    t.append("    ░░░   ░░░░░░░░░░                                      \n")
-    t.append("   ░░░░░░░░░░░░░░░░░░░                                    \n")
-    t.append(" " * 58 + "\n")
-
-    # Right-side gradient + clawd
-    t.append("                           ░░░░                     ██    \n", style=d)
-    t.append("                         ░░░░░░░░░░               ██▒▒██  \n", style=d)
-    t.append("                                            ▒▒      ██   ▒\n")
-
-    t.append("      ")
-    t.append(" █████████ ", style=cb)
-    t.append("                         ▒▒░░▒▒      ▒ ▒▒\n")
-
-    t.append("      ")
-    t.append("██▄█████▄██", style=cb_bg)
-    t.append("                           ▒▒         ▒▒ \n")
-
-    t.append("      ")
-    t.append(" █████████ ", style=cb)
-    t.append("                          ░          ▒   \n")
-
-    # Footer
-    t.append(ELLIPSIS * 7)
-    t.append("█ █   █ █", style=cb)
-    t.append(ELLIPSIS * 26)
-    t.append("░")
-    t.append(ELLIPSIS * 9)
-    t.append("▒")
-    t.append(ELLIPSIS * 4)
-    t.append("\n")
-
-    return t
+    """Build the light-theme CCOS welcome banner."""
+    return _build_welcome_dark(version, colors)
 
 
 class Renderer:
@@ -217,7 +185,7 @@ class Renderer:
         self._theme_name = resolved
 
     def print_welcome(self, model: str, provider: str, cwd: str) -> None:
-        """Print the CC-style welcome banner with Clawd ASCII art."""
+        """Print the CCOS welcome banner."""
         if self._theme_name in ("light", "light-ansi", "light-daltonized"):
             banner = _build_welcome_light(__version__, self.theme)
         else:
