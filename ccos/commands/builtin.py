@@ -1349,6 +1349,225 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                 "[dim]Subcommands: /mcp add|remove|reconnect|enable|disable|test|tools|resources|prompts[/dim]"
             )
 
+    # ── Co-author configuration ────────────────────────────────
+    def cmd_co_author(args: str = "", **_: Any) -> None:
+        """Configure the Co-Authored-By trailer for git commits."""
+        console = Console()
+        arg = args.strip()
+
+        if not arg:
+            # Show current setting
+            current = app.config.git.co_author
+            if current:
+                console.print(f"Co-author: [cyan]{current}[/cyan]")
+            else:
+                console.print("[dim]Co-author is disabled.[/dim]")
+            console.print()
+            console.print("[dim]Usage:[/dim]")
+            console.print("  /co-author Name <email>   Set co-author")
+            console.print("  /co-author off             Disable co-author")
+            return
+
+        if arg.lower() in ("off", "disable", "none", "false", ""):
+            app.config.git.co_author = ""
+            app.engine.co_author = ""
+            app.config.save()
+            console.print("[green]Co-author disabled.[/green] Commits will not include a Co-Authored-By trailer.")
+        else:
+            app.config.git.co_author = arg
+            app.engine.co_author = arg
+            app.config.save()
+            console.print(f"[green]Co-author set to:[/green] [cyan]{arg}[/cyan]")
+            console.print("[dim]All future commits will include: Co-Authored-By: " + arg + "[/dim]")
+
+    # ── Skill management commands ────────────────────────────────
+    def cmd_skills(args: str = "", **_: Any) -> None:
+        """Manage skills: list, create, edit, delete, show, reload."""
+        console = Console()
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0] if parts else ""
+        sub_args = parts[1].strip() if len(parts) > 1 else ""
+
+        if not hasattr(app, "skill_registry") or app.skill_registry is None:
+            console.print("[red]Skill system not initialized.[/red]")
+            return
+
+        if subcmd == "create" or subcmd == "new":
+            # /skills create <name> [description]
+            if not sub_args:
+                console.print("[red]Usage: /skills create <name> [description][/red]")
+                return
+            create_parts = sub_args.split(maxsplit=1)
+            name = create_parts[0]
+            desc = create_parts[1] if len(create_parts) > 1 else ""
+
+            from ccos.skills.loader import create_skill_template
+            try:
+                path = create_skill_template(name, app.cwd, description=desc)
+                console.print(f"[green]Created skill:[/green] {path}")
+                console.print("[dim]Edit the SKILL.md file to customize your skill.[/dim]")
+                # Reload skills
+                _reload_skills()
+            except Exception as e:
+                console.print(f"[red]Error creating skill: {e}[/red]")
+
+        elif subcmd == "delete" or subcmd == "rm" or subcmd == "remove":
+            # /skills delete <name>
+            if not sub_args:
+                console.print("[red]Usage: /skills delete <name>[/red]")
+                return
+            from ccos.skills.loader import delete_skill
+            if delete_skill(sub_args, app.cwd):
+                console.print(f"[green]Deleted skill:[/green] {sub_args}")
+                _reload_skills()
+            else:
+                console.print(f"[red]Skill not found: {sub_args}[/red]")
+
+        elif subcmd == "show" or subcmd == "view":
+            # /skills show <name>
+            if not sub_args:
+                console.print("[red]Usage: /skills show <name>[/red]")
+                return
+            skill = app.skill_registry.get(sub_args)
+            if skill is None:
+                console.print(f"[red]Skill not found: {sub_args}[/red]")
+                return
+            console.print(Panel(
+                f"[cyan bold]{skill.user_facing_name()}[/cyan bold]\n\n"
+                f"[dim]Name:[/dim]        {skill.name}\n"
+                f"[dim]Source:[/dim]      {skill.source.value}\n"
+                f"[dim]File:[/dim]        {skill.loaded_from}\n"
+                f"[dim]Description:[/dim] {skill.description or '(none)'}\n"
+                f"[dim]Arguments:[/dim]   {' '.join(skill.argument_names) if skill.argument_names else '(none)'}\n"
+                f"[dim]Hint:[/dim]        {skill.argument_hint or '(none)'}\n"
+                f"[dim]Tools:[/dim]       {', '.join(skill.allowed_tools) if skill.allowed_tools else '(all)'}\n"
+                f"[dim]Context:[/dim]     {skill.context.value}\n"
+                f"[dim]Model:[/dim]       {skill.model or '(default)'}\n"
+                f"[dim]User:[/dim]        {'yes' if skill.user_invocable else 'no'}\n"
+                f"[dim]Model invoke:[/dim] {'no' if skill.disable_model_invocation else 'yes'}\n"
+                f"[dim]Conditional:[/dim] {', '.join(skill.paths) if skill.paths else 'no'}\n"
+                f"\n--- Content ---\n\n{skill.content[:2000]}{'...' if len(skill.content) > 2000 else ''}",
+                title=f"Skill: {skill.name}",
+                border_style="cyan",
+            ))
+
+        elif subcmd == "edit":
+            # /skills edit <name> — open in editor
+            if not sub_args:
+                console.print("[red]Usage: /skills edit <name>[/red]")
+                return
+            skill = app.skill_registry.get(sub_args)
+            if skill is None:
+                console.print(f"[red]Skill not found: {sub_args}[/red]")
+                return
+            editor = os.environ.get("EDITOR", "notepad" if os.name == "nt" else "vi")
+            try:
+                subprocess.run([editor, skill.loaded_from], check=False)
+                console.print(f"[dim]Reloading skills...[/dim]")
+                _reload_skills()
+            except Exception as e:
+                console.print(f"[red]Could not open editor: {e}[/red]")
+                console.print(f"[dim]File: {skill.loaded_from}[/dim]")
+
+        elif subcmd == "reload":
+            # /skills reload
+            count = _reload_skills()
+            console.print(f"[green]Reloaded {count} skills.[/green]")
+
+        else:
+            # Default: list all skills
+            all_skills = app.skill_registry.get_all_including_conditional()
+            if not all_skills:
+                from pathlib import Path as _Path
+                user_skills = _Path.home() / ".ccos" / "skills"
+                console.print("[dim]No skills found.[/dim]")
+                console.print()
+                console.print("[dim]Create a skill:[/dim]")
+                console.print("  /skills create <name> [description]")
+                console.print()
+                console.print("[dim]Or create manually:[/dim]")
+                console.print(f"  mkdir {user_skills / 'my-skill'}")
+                console.print("  Create SKILL.md with YAML frontmatter + content")
+                return
+
+            table = Table(title="Available Skills", border_style="dim")
+            table.add_column("Name", style="cyan")
+            table.add_column("Description")
+            table.add_column("Source", style="dim")
+            table.add_column("Args", style="dim")
+            table.add_column("Context", style="dim")
+
+            for skill in all_skills:
+                flags = []
+                if not skill.user_invocable:
+                    flags.append("no-user")
+                if skill.disable_model_invocation:
+                    flags.append("no-model")
+                if skill.is_conditional:
+                    flags.append("conditional")
+
+                table.add_row(
+                    f"/{skill.name}",
+                    skill.description[:60] + ("..." if len(skill.description) > 60 else ""),
+                    skill.source.value,
+                    skill.argument_hint or ("-" if not skill.argument_names else " ".join(skill.argument_names)),
+                    skill.context.value + (" " + " ".join(flags) if flags else ""),
+                )
+
+            console.print(table)
+            console.print()
+            console.print(
+                "[dim]Subcommands: /skills create|delete|show|edit|reload[/dim]"
+            )
+
+    def _reload_skills() -> int:
+        """Reload skills from disk and re-register as slash commands."""
+        from ccos.skills.loader import load_all_skills
+        skills = load_all_skills(app.cwd)
+        app.skill_registry.reload(skills)
+        _register_skill_slash_commands()
+        return len(skills)
+
+    def _register_skill_slash_commands() -> None:
+        """Register user-invocable skills as slash commands."""
+        # Remove old skill-based slash commands
+        to_remove = [
+            name for name, cmd in registry._commands.items()
+            if hasattr(cmd, '_is_skill_command') and cmd._is_skill_command
+        ]
+        for name in to_remove:
+            del registry._commands[name]
+
+        # Register new ones
+        for skill in app.skill_registry.get_user_invocable():
+            def make_handler(sk):
+                def handler(args: str = "", **_: Any) -> None:
+                    """Invoke skill and inject into conversation."""
+                    console = Console()
+                    try:
+                        content = app.skill_executor.prepare_skill_content(sk, args)
+                        # Inject as user message into engine
+                        console.print(f"[dim]Running skill: {sk.name}...[/dim]")
+                        # Add skill content as a user message and run engine turn
+                        app.session_manager.save_user_message(f"/{sk.name} {args}".strip())
+                        result = app._run_async(app._async_skill_turn(content))
+                        app.renderer.flush_streaming()
+                        app._persist_last_assistant()
+                    except KeyboardInterrupt:
+                        app.renderer.flush_streaming()
+                        app.renderer.print_status("Interrupted.")
+                    except Exception as e:
+                        console.print(f"[red]Skill error: {e}[/red]")
+                return handler
+
+            cmd = SlashCommand(
+                name=skill.name,
+                description=skill.description or f"Skill: {skill.name}",
+                handler=make_handler(skill),
+            )
+            cmd._is_skill_command = True  # type: ignore[attr-defined]
+            registry.register(cmd)
+
     # Register all
     registry.register(SlashCommand("help", "Show available commands", cmd_help, aliases=["?"]))
     registry.register(SlashCommand("exit", "Exit the application", cmd_exit, aliases=["quit", "q"]))
@@ -1390,3 +1609,9 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
     registry.register(SlashCommand("copy", "Copy last response to clipboard", cmd_copy))
     registry.register(SlashCommand("color", "Preview color theme", cmd_color))
     registry.register(SlashCommand("mcp", "Manage MCP servers (add/remove/reconnect/test)", cmd_mcp))
+    registry.register(SlashCommand("skills", "Manage skills (list/create/delete/show/edit/reload)", cmd_skills))
+    registry.register(SlashCommand("co-author", "Configure Co-Authored-By for git commits", cmd_co_author))
+
+    # Register skill-based slash commands (if skill system is initialized)
+    if hasattr(app, "skill_registry") and app.skill_registry is not None:
+        _register_skill_slash_commands()

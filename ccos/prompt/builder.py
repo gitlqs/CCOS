@@ -19,6 +19,11 @@ from ccos.prompt.sections import (
 )
 from ccos.tools.base import Tool
 
+# Avoid circular import — SkillDefinition only needed for type hints
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ccos.skills.types import SkillDefinition
+
 
 DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
@@ -39,6 +44,8 @@ class PromptBuilder:
         provider_name: str = "anthropic",
         plan_mode: bool = False,
         plan_content: str = "",
+        skills: list[SkillDefinition] | None = None,
+        co_author: str = "",
     ) -> str:
         sections: list[str] = []
 
@@ -50,9 +57,13 @@ class PromptBuilder:
         sections.append(get_tools_section(tools))
         sections.append(get_tone_section())
         sections.append(get_output_efficiency_section())
-        sections.append(get_git_commit_section())
+        sections.append(get_git_commit_section(co_author=co_author))
         sections.append(get_pr_section())
         sections.append(get_bash_instructions())
+
+        # ── Skills section ───────────────────────────────────────
+        if skills:
+            sections.append(self._build_skills_section(skills))
 
         # ── Dynamic boundary ─────────────────────────────────────
         sections.append(DYNAMIC_BOUNDARY)
@@ -90,3 +101,25 @@ class PromptBuilder:
 
         # Filter empty sections and join
         return "\n\n".join(s for s in sections if s and s != DYNAMIC_BOUNDARY)
+
+    @staticmethod
+    def _build_skills_section(skills: list[SkillDefinition]) -> str:
+        """Build the system prompt section describing available skills."""
+        from ccos.skills.types import SkillDefinition as SD  # avoid import at module level
+
+        lines = [
+            "# Available Skills",
+            "",
+            "The following skills are available. Use the Skill tool to invoke them.",
+            "When a user references a slash command (e.g., /commit, /review-pr), "
+            "they are referring to a skill — invoke it using the Skill tool.",
+            "",
+        ]
+
+        for skill in skills:
+            hint = f" {skill.argument_hint}" if skill.argument_hint else ""
+            desc = f" - {skill.description}" if skill.description else ""
+            when = f"\n  When to use: {skill.when_to_use}" if skill.when_to_use else ""
+            lines.append(f"- `/{skill.name}{hint}`{desc}{when}")
+
+        return "\n".join(lines)

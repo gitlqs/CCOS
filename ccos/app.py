@@ -21,6 +21,9 @@ from ccos.plan import PlanManager
 from ccos.prompt.builder import PromptBuilder
 from ccos.providers.base import LLMProvider, ToolCallContent
 from ccos.providers.registry import ProviderRegistry
+from ccos.skills.executor import SkillExecutor
+from ccos.skills.loader import load_all_skills
+from ccos.skills.registry import SkillRegistry
 from ccos.tools.base import ToolContext, ToolRegistry, create_default_registry
 from ccos.ui.input import PromptMode, create_input_session, get_user_input
 from ccos.ui.renderer import Renderer
@@ -103,6 +106,27 @@ class App:
             if isinstance(exit_plan, ExitPlanModeTool):
                 exit_plan._plan_manager = self.plan_manager
 
+        # Skills system
+        self.skill_registry = SkillRegistry()
+        self.skill_executor = SkillExecutor(
+            skill_registry=self.skill_registry,
+            engine_factory=None,  # Wired after engine creation
+        )
+        # Load skills from disk
+        try:
+            skills = load_all_skills(self.cwd)
+            for skill in skills:
+                self.skill_registry.register(skill)
+        except Exception:
+            pass  # Don't crash if skills fail to load
+
+        # Wire SkillTool
+        from ccos.tools.skill_tool import SkillTool
+        skill_tool = SkillTool()
+        skill_tool._skill_registry = self.skill_registry
+        skill_tool._skill_executor = self.skill_executor
+        self.tool_registry.register(skill_tool)
+
         # Permissions
         perm_mode = PermissionMode.TRUST_ALL if trust_all else PermissionMode(
             self.config.permissions.mode
@@ -129,10 +153,15 @@ class App:
             on_tool_end=self.renderer.print_tool_result,
             on_thinking=self.renderer.print_thinking,
             hooks=self.hooks,
+            skill_registry=self.skill_registry,
+            co_author=self.config.git.co_author,
         )
 
         # Wire memory extractor's engine factory
         self.memory_extractor._engine_factory = self._create_sub_engine
+
+        # Wire skill executor's engine factory
+        self.skill_executor._engine_factory = self._create_sub_engine
 
         # Commands
         self.commands = CommandRegistry()
@@ -212,6 +241,9 @@ class App:
             from ccos.tools.plan_mode import ExitPlanModeTool
             if isinstance(exit_plan, ExitPlanModeTool):
                 exit_plan._session_id = self.session_manager.session_id
+
+        # Wire session ID into skill executor
+        self.skill_executor.session_id = self.session_manager.session_id or ""
 
         self.renderer.print_welcome(self.model, self.provider.name, self.cwd)
 
@@ -355,6 +387,11 @@ class App:
         """Connect MCP (if needed) then run an engine turn in one event loop."""
         await self._ensure_mcp()
         return await self.engine.run_turn(user_input)
+
+    async def _async_skill_turn(self, skill_content: str) -> str:
+        """Run a skill's prepared content as a user turn through the engine."""
+        await self._ensure_mcp()
+        return await self.engine.run_turn(skill_content)
 
     def _persist_last_assistant(self) -> None:
         """Save the last assistant message to the session transcript."""

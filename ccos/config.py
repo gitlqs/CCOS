@@ -49,6 +49,11 @@ class PermissionsConfig:
 
 
 @dataclass
+class GitConfig:
+    co_author: str = "CCOS <noreply@ccos.dev>"  # "" to disable
+
+
+@dataclass
 class UIConfig:
     theme: str = "auto"
     vim_mode: bool = False
@@ -61,6 +66,7 @@ class Config:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
     ui: UIConfig = field(default_factory=UIConfig)
+    git: GitConfig = field(default_factory=GitConfig)
     hooks: dict[str, Any] = field(default_factory=dict)
     mcp_servers: dict[str, Any] = field(default_factory=dict)
 
@@ -129,12 +135,18 @@ class Config:
             vim_mode=ui_raw.get("vim_mode", False),
         )
 
+        git_raw = d.get("git", {})
+        git = GitConfig(
+            co_author=git_raw.get("co_author", "CCOS <noreply@ccos.dev>"),
+        )
+
         return cls(
             default_provider=d.get("default_provider", "anthropic"),
             default_model=d.get("default_model", "claude-sonnet-4-6"),
             providers=providers,
             permissions=perms,
             ui=ui,
+            git=git,
             hooks=d.get("hooks", {}),
             mcp_servers=d.get("mcp_servers", d.get("mcpServers", {})),
         )
@@ -155,6 +167,9 @@ class Config:
             "ui": {
                 "theme": self.ui.theme,
                 "vim_mode": self.ui.vim_mode,
+            },
+            "git": {
+                "co_author": self.git.co_author,
             },
             "hooks": self.hooks,
             "mcp_servers": self.mcp_servers,

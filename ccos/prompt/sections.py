@@ -242,8 +242,31 @@ explanations. This does not apply to code or tool calls."""
 # 8. Git commit instructions
 # ═══════════════════════════════════════════════════════════════════════
 
-def get_git_commit_section() -> str:
-    return """\
+def get_git_commit_section(co_author: str = "") -> str:
+    # Build co-author trailer instructions
+    if co_author:
+        co_author_step = (
+            f"   - Create the commit with a message ending with:\n"
+            f"   Co-Authored-By: {co_author}"
+        )
+        co_author_example = (
+            f"git commit -m \"$(cat <<'EOF'\n"
+            f"   Commit message here.\n"
+            f"\n"
+            f"   Co-Authored-By: {co_author}\n"
+            f"   EOF\n"
+            f"   )\""
+        )
+    else:
+        co_author_step = "   - Create the commit with a message."
+        co_author_example = (
+            "git commit -m \"$(cat <<'EOF'\n"
+            "   Commit message here.\n"
+            "   EOF\n"
+            "   )\""
+        )
+
+    return f"""\
 # Committing changes with git
 
 Only create commits when requested by the user. If unclear, ask first. When the user asks you \
@@ -288,8 +311,7 @@ user if they specifically request to commit those files
   - Ensure it accurately reflects the changes and their purpose
 3. Run the following commands in parallel:
    - Add relevant untracked files to the staging area.
-   - Create the commit with a message ending with:
-   Co-Authored-By: CCOS <noreply@ccos.dev>
+{co_author_step}
    - Run git status after the commit completes to verify success.
    Note: git status depends on the commit completing, so run it sequentially after the commit.
 4. If the commit fails due to pre-commit hook: fix the issue and create a NEW commit
@@ -307,12 +329,7 @@ create an empty commit
 - In order to ensure good formatting, ALWAYS pass the commit message via a HEREDOC, a la \
 this example:
 ```
-git commit -m "$(cat <<'EOF'
-   Commit message here.
-
-   Co-Authored-By: CCOS <noreply@ccos.dev>
-   EOF
-   )"
+{co_author_example}
 ```"""
 
 

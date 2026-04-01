@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable
 
 from rich.console import Console
 
@@ -68,6 +68,8 @@ class QueryEngine:
         on_tool_end: Callable[[str, str, bool], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
         hooks: HookManager | None = None,
+        skill_registry: Any = None,
+        co_author: str = "",
     ):
         self.provider = provider
         self.model = model
@@ -80,6 +82,8 @@ class QueryEngine:
         self.console = console or Console()
         self.thinking = thinking
         self.hooks = hooks
+        self.skill_registry = skill_registry
+        self.co_author = co_author
         # Callbacks for UI
         self._on_text = on_text
         self._on_tool_start = on_tool_start
@@ -103,11 +107,19 @@ class QueryEngine:
                 self._auto_compact()
 
             # Build system prompt
+            model_skills = None
+            if self.skill_registry is not None:
+                try:
+                    model_skills = self.skill_registry.get_model_invocable()
+                except Exception:
+                    pass
             system = self.prompt_builder.build(
                 tools=self.tools.get_all(),
                 model=self.model,
                 cwd=self.ctx.cwd,
                 provider_name=self.provider.name,
+                co_author=self.co_author,
+                skills=model_skills,
             )
 
             # Get tool schemas

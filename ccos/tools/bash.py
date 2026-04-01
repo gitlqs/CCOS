@@ -80,64 +80,94 @@ class BashTool(Tool):
 
         timeout_s = timeout_ms / 1000.0
 
-        # Determine shell
-        if get_platform() == "windows":
-            shell_cmd = ["bash", "-c", command]
-            # Fallback to cmd if bash isn't available
-            try:
-                subprocess.run(["bash", "--version"], capture_output=True, timeout=5)
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                shell_cmd = ["cmd", "/c", command]
-        else:
-            shell_cmd = ["bash", "-c", command]
-
         if run_in_background:
+            shell_cmd = self._build_shell_cmd(command)
             return await self._run_background(shell_cmd, command, ctx)
 
+        # Use subprocess.run in a thread executor for maximum compatibility.
+        # asyncio.create_subprocess_exec has known issues on Windows
+        # (ProactorEventLoop + pipes can silently fail).
+        loop = asyncio.get_event_loop()
         try:
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *shell_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=ctx.cwd,
-                    env={**os.environ},
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self._run_sync(command, ctx.cwd, timeout_s),
                 ),
-                timeout=10,  # timeout for process creation
+                timeout=timeout_s + 5,  # small buffer over inner timeout
             )
-
-            try:
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return ToolOutput(
-                    content=f"Command timed out after {timeout_s:.0f}s. Consider using run_in_background=true for long-running commands.",
-                    is_error=True,
-                )
-
-            output = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
-
-            # Truncate if too large
-            if len(output) > _MAX_RESULT_CHARS:
-                truncated = output[:_MAX_RESULT_CHARS]
-                output = truncated + f"\n\n... (output truncated, {len(output)} total characters)"
-
-            if proc.returncode != 0:
-                output = f"{output}\n\nExit code: {proc.returncode}" if output else f"Exit code: {proc.returncode}"
-
-            return ToolOutput(content=output or "(no output)")
-
-        except FileNotFoundError:
+            return result
+        except asyncio.TimeoutError:
             return ToolOutput(
-                content="Error: Shell not found. Ensure bash or cmd is available.",
+                content=f"Command timed out after {timeout_s:.0f}s. Consider using run_in_background=true for long-running commands.",
                 is_error=True,
             )
         except Exception as e:
-            return ToolOutput(content=f"Error executing command: {e}", is_error=True)
+            return ToolOutput(
+                content=f"Error executing command: {type(e).__name__}: {e!r}",
+                is_error=True,
+            )
+
+    @staticmethod
+    def _run_sync(command: str, cwd: str, timeout_s: float) -> ToolOutput:
+        """Run a command synchronously using subprocess.run (thread-safe)."""
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                cwd=cwd,
+                timeout=timeout_s,
+                env={**os.environ},
+            )
+
+            stdout = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
+            stderr = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+
+            # Combine stdout + stderr
+            output = stdout
+            if stderr:
+                output = f"{stdout}\n{stderr}".strip() if stdout else stderr
+
+            # Truncate if too large
+            if len(output) > _MAX_RESULT_CHARS:
+                output = output[:_MAX_RESULT_CHARS] + f"\n\n... (output truncated, {len(output)} total characters)"
+
+            if proc.returncode != 0:
+                if output:
+                    output = f"{output}\n\nExit code: {proc.returncode}"
+                else:
+                    output = f"Exit code: {proc.returncode}"
+
+            return ToolOutput(content=output or "(no output)")
+
+        except subprocess.TimeoutExpired:
+            return ToolOutput(
+                content=f"Command timed out after {timeout_s:.0f}s. Consider using run_in_background=true for long-running commands.",
+                is_error=True,
+            )
+        except FileNotFoundError as e:
+            return ToolOutput(
+                content=f"Error: Shell not found ({e}). Ensure bash or cmd is available.",
+                is_error=True,
+            )
+        except Exception as e:
+            return ToolOutput(
+                content=f"Error executing command: {type(e).__name__}: {e!r}",
+                is_error=True,
+            )
+
+    @staticmethod
+    def _build_shell_cmd(command: str) -> list[str]:
+        """Build shell command list for background execution."""
+        if get_platform() == "windows":
+            # Prefer bash (Git Bash) if available, fallback to cmd
+            try:
+                subprocess.run(["bash", "--version"], capture_output=True, timeout=5)
+                return ["bash", "-c", command]
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return ["cmd", "/c", command]
+        return ["bash", "-c", command]
 
     async def _run_background(
         self,
