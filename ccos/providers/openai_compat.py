@@ -187,64 +187,72 @@ class OpenAICompatProvider(LLMProvider):
 
         response = await self._client.chat.completions.create(**params)
 
-        async for chunk in response:
-            choice = chunk.choices[0] if chunk.choices else None
+        try:
+            async for chunk in response:
+                choice = chunk.choices[0] if chunk.choices else None
 
-            if choice is None:
-                # Usage-only chunk at the end
-                if chunk.usage:
-                    yield StreamChunk(
-                        type=ChunkType.DONE,
-                        stop_reason="end_turn" if not partial_tool_calls else "tool_use",
-                        input_tokens=chunk.usage.prompt_tokens or 0,
-                        output_tokens=chunk.usage.completion_tokens or 0,
-                    )
-                continue
-
-            delta = choice.delta
-            finish_reason = choice.finish_reason
-
-            # Text content
-            if delta and delta.content:
-                yield StreamChunk(type=ChunkType.TEXT, text=delta.content)
-
-            # Tool calls
-            if delta and delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in partial_tool_calls:
-                        # New tool call
-                        tc = ToolCallContent(
-                            id=tc_delta.id or f"call_{uuid.uuid4().hex[:24]}",
-                            name=tc_delta.function.name if tc_delta.function and tc_delta.function.name else "",
-                        )
-                        partial_tool_calls[idx] = tc
-                        partial_args[idx] = ""
-                        yield StreamChunk(type=ChunkType.TOOL_CALL_START, tool_call=tc)
-
-                    if tc_delta.function and tc_delta.function.arguments:
-                        partial_args[idx] += tc_delta.function.arguments
+                if choice is None:
+                    # Usage-only chunk at the end
+                    if chunk.usage:
                         yield StreamChunk(
-                            type=ChunkType.TOOL_CALL_DELTA,
-                            text=tc_delta.function.arguments,
+                            type=ChunkType.DONE,
+                            stop_reason="end_turn" if not partial_tool_calls else "tool_use",
+                            input_tokens=chunk.usage.prompt_tokens or 0,
+                            output_tokens=chunk.usage.completion_tokens or 0,
                         )
+                    continue
 
-            # Finish
-            if finish_reason:
-                # Finalise any open tool calls
-                for idx, tc in partial_tool_calls.items():
-                    try:
-                        tc.input = json.loads(partial_args.get(idx, "{}"))
-                    except json.JSONDecodeError:
-                        tc.input = {}
-                    yield StreamChunk(type=ChunkType.TOOL_CALL_END, tool_call=tc)
+                delta = choice.delta
+                finish_reason = choice.finish_reason
 
-                stop = "tool_use" if finish_reason == "tool_calls" else "end_turn"
-                # Don't yield DONE here — wait for the usage chunk
-                if not chunk.usage:
-                    yield StreamChunk(
-                        type=ChunkType.DONE,
-                        stop_reason=stop,
-                        input_tokens=0,
-                        output_tokens=0,
-                    )
+                # Text content
+                if delta and delta.content:
+                    yield StreamChunk(type=ChunkType.TEXT, text=delta.content)
+
+                # Tool calls
+                if delta and delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in partial_tool_calls:
+                            # New tool call
+                            tc = ToolCallContent(
+                                id=tc_delta.id or f"call_{uuid.uuid4().hex[:24]}",
+                                name=tc_delta.function.name if tc_delta.function and tc_delta.function.name else "",
+                            )
+                            partial_tool_calls[idx] = tc
+                            partial_args[idx] = ""
+                            yield StreamChunk(type=ChunkType.TOOL_CALL_START, tool_call=tc)
+
+                        if tc_delta.function and tc_delta.function.arguments:
+                            partial_args[idx] += tc_delta.function.arguments
+                            yield StreamChunk(
+                                type=ChunkType.TOOL_CALL_DELTA,
+                                text=tc_delta.function.arguments,
+                            )
+
+                # Finish
+                if finish_reason:
+                    # Finalise any open tool calls
+                    for idx, tc in partial_tool_calls.items():
+                        try:
+                            tc.input = json.loads(partial_args.get(idx, "{}"))
+                        except json.JSONDecodeError:
+                            tc.input = {}
+                        yield StreamChunk(type=ChunkType.TOOL_CALL_END, tool_call=tc)
+
+                    stop = "tool_use" if finish_reason == "tool_calls" else "end_turn"
+                    # Don't yield DONE here — wait for the usage chunk
+                    if not chunk.usage:
+                        yield StreamChunk(
+                            type=ChunkType.DONE,
+                            stop_reason=stop,
+                            input_tokens=0,
+                            output_tokens=0,
+                        )
+        finally:
+            # Explicitly close the OpenAI SDK stream to release the
+            # underlying httpx connection. Without this, GC of the
+            # stream object schedules an async_generator_athrow task
+            # that never runs, producing:
+            #   "Task was destroyed but it is pending!"
+            await response.close()
