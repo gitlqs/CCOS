@@ -34,39 +34,36 @@ def has_ripgrep() -> bool:
     return shutil.which("rg") is not None
 
 
+def _run_git(args: list[str], cwd: str) -> str:
+    """Run a git command and return stdout as a string.
+
+    Uses encoding='utf-8' explicitly — git outputs UTF-8 on all platforms,
+    but Windows defaults to the system codepage (e.g., GBK) which breaks
+    on non-ASCII commit messages.
+    """
+    try:
+        r = subprocess.run(
+            args, cwd=cwd, capture_output=True,
+            timeout=5, encoding="utf-8", errors="replace",
+        )
+        if r.returncode == 0 and r.stdout:
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
 def get_git_info(cwd: str) -> dict[str, str | bool]:
     """Gather basic git information for the working directory."""
     info: dict[str, str | bool] = {"is_git_repo": False}
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
+        check = _run_git(["git", "rev-parse", "--is-inside-work-tree"], cwd)
+        if check != "true":
             return info
         info["is_git_repo"] = True
-
-        # Branch
-        r = subprocess.run(
-            ["git", "branch", "--show-current"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
-        )
-        info["branch"] = r.stdout.strip() if r.returncode == 0 else ""
-
-        # Recent commits (last 5)
-        r = subprocess.run(
-            ["git", "log", "--oneline", "-5"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
-        )
-        info["recent_commits"] = r.stdout.strip() if r.returncode == 0 else ""
-
-        # Status
-        r = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=cwd, capture_output=True, text=True, timeout=5,
-        )
-        info["status"] = r.stdout.strip() if r.returncode == 0 else ""
-
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        info["branch"] = _run_git(["git", "branch", "--show-current"], cwd)
+        info["recent_commits"] = _run_git(["git", "log", "--oneline", "-5"], cwd)
+        info["status"] = _run_git(["git", "status", "--short"], cwd)
+    except Exception:
         pass
     return info
