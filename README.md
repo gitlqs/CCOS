@@ -7,6 +7,10 @@ CCOS 是一个 Python agentic coding CLI。
 - **多模型支持** — Anthropic Claude、OpenAI GPT、Grok、Ollama 等任意 LLM
 - **完整 Agentic Loop** — 流式响应 → 工具调用 → 执行 → 反馈循环，最多 50 轮
 - **19 个内置工具** — 文件读写、Bash 执行、代码搜索、Web 抓取等
+- **Skill 插件系统** — 支持自定义 Slash 命令（/技能名），通过 `/skills` 管理技能插件
+- **Co-Author 配置** — `/co-author` 命令为 git commit 添加协作作者
+- **异步与流式改进** — 事件循环与 async 清理更健壮，避免任务泄露警告
+- **丰富斜杠命令集** — 39 个命令（模型、记忆、权限、MCP、git 等全覆盖）
 - **MCP 协议支持** — stdio/SSE/HTTP/WebSocket 四种传输，连接外部工具服务器
 - **自动记忆系统** — 跨会话持久化用户偏好、项目上下文、反馈记录
 
