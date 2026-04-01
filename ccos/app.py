@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import logging
 import os
 import signal
 from typing import Any
 
 from rich.console import Console
+
+
+# ── Suppress harmless "Task was destroyed but it is pending!" ───────
+# With a persistent event loop (required for MCP stdio transports),
+# async-generator finalization tasks (athrow) get scheduled by GC
+# between run_until_complete() calls. These tasks are pending when
+# GC later collects them, triggering this warning. The underlying
+# streams have already been fully consumed and closed — the warning
+# is cosmetic noise. We suppress it at the asyncio logger level.
+
+class _SuppressTaskDestroyed(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Task was destroyed" not in record.getMessage()
+
+
+logging.getLogger("asyncio").addFilter(_SuppressTaskDestroyed())
 
 from ccos.commands.builtin import register_builtin_commands
 from ccos.commands.registry import CommandRegistry
@@ -185,7 +203,16 @@ class App:
 
     def _run_async(self, coro) -> Any:
         """Run a coroutine on the persistent event loop."""
-        return self._get_loop().run_until_complete(coro)
+        loop = self._get_loop()
+        result = loop.run_until_complete(coro)
+        # Force GC now so async-generator finalization tasks are created
+        # while the loop is still accessible, then drain them immediately.
+        gc.collect()
+        try:
+            loop.run_until_complete(asyncio.sleep(0))
+        except Exception:
+            pass
+        return result
 
     def _shutdown_loop(self) -> None:
         """Shut down MCP transports then close the event loop."""
