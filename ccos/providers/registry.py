@@ -26,6 +26,8 @@ class ProviderRegistry:
             return self._make_anthropic(pcfg, name)
         if name == "openai":
             return self._make_openai(pcfg, name)
+        if name == "gemini":
+            return self._make_gemini(pcfg, name)
         if name == "ollama":
             return self._make_ollama(pcfg)
         if name == "llamacpp":
@@ -116,6 +118,17 @@ class ProviderRegistry:
         if pcfg and pcfg.base_url:
             kwargs["base_url"] = pcfg.base_url
         return OpenAIProvider(**kwargs)
+
+    @staticmethod
+    def _make_gemini(pcfg: ProviderConfig | None, name: str) -> LLMProvider:
+        from ccos.providers.gemini import GeminiProvider
+        kwargs: dict = {}
+        key = ProviderRegistry._resolve_key(pcfg, name)
+        if key:
+            kwargs["api_key"] = key
+        if pcfg and pcfg.base_url:
+            kwargs["base_url"] = pcfg.base_url
+        return GeminiProvider(**kwargs)
 
     @staticmethod
     def _make_ollama(pcfg: ProviderConfig | None) -> LLMProvider:
