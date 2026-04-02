@@ -47,6 +47,7 @@ class Credentials:
         env_map = {
             "anthropic": "ANTHROPIC_API_KEY",
             "openai": "OPENAI_API_KEY",
+            "gemini": "GEMINI_API_KEY",
             "grok": "XAI_API_KEY",
             "xai": "XAI_API_KEY",
         }
@@ -70,7 +71,7 @@ class Credentials:
         if self.oauth_token:
             return True
         # Check env vars
-        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY"):
             if os.environ.get(var):
                 return True
         return False

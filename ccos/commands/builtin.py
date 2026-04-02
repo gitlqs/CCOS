@@ -472,6 +472,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         checks = [
             ("ANTHROPIC_API_KEY", "Anthropic"),
             ("OPENAI_API_KEY", "OpenAI"),
+            ("GEMINI_API_KEY", "Google Gemini"),
             ("XAI_API_KEY", "Grok/xAI"),
             ("BRAVE_SEARCH_API_KEY", "Brave Search"),
         ]
@@ -546,12 +547,13 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         console.print("  1. Anthropic — API key (sk-ant-...)")
         console.print("  2. Anthropic — OAuth (Claude.ai browser login, Pro/Max subscription)")
         console.print("  3. OpenAI (GPT-4o, o1, etc.)")
-        console.print("  4. xAI / Grok")
-        console.print("  5. Custom provider")
+        console.print("  4. Google Gemini")
+        console.print("  5. xAI / Grok")
+        console.print("  6. Custom provider")
         console.print()
 
         try:
-            choice = console.input("[yellow]Choice (1-5): [/yellow]").strip()
+            choice = console.input("[yellow]Choice (1-6): [/yellow]").strip()
         except (EOFError, KeyboardInterrupt):
             return
 
@@ -633,8 +635,8 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                 pass
             return
 
-        # ── Options 1, 3-5: API key login ─────────────────────────────────
-        provider_map = {"1": "anthropic", "3": "openai", "4": "grok", "5": "custom"}
+        # ── Options 1, 3-6: API key login ─────────────────────────────────
+        provider_map = {"1": "anthropic", "3": "openai", "4": "gemini", "5": "grok", "6": "custom"}
         provider = provider_map.get(choice)
         if not provider:
             console.print("[red]Invalid choice.[/red]")
@@ -652,6 +654,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         key_hint = {
             "anthropic": "sk-ant-...",
             "openai": "sk-...",
+            "gemini": "AIza...",
             "grok": "xai-...",
         }.get(provider, "")
         prompt = f"API key ({key_hint}): " if key_hint else "API key: "

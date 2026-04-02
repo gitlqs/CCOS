@@ -101,6 +101,11 @@ class Config:
                     api_key_env="OPENAI_API_KEY",
                     default_model="gpt-4o",
                 ),
+                "gemini": ProviderConfig(
+                    api_key_env="GEMINI_API_KEY",
+                    base_url="https://generativelanguage.googleapis.com/v1beta",
+                    default_model="gemini-2.5-flash",
+                ),
                 "ollama": ProviderConfig(
                     base_url="http://localhost:11434/v1",
                     default_model="llama3.1",
