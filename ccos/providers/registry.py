@@ -28,6 +28,8 @@ class ProviderRegistry:
             return self._make_openai(pcfg, name)
         if name == "ollama":
             return self._make_ollama(pcfg)
+        if name == "llamacpp":
+            return self._make_llamacpp(pcfg)
 
         # Fallback: try openai_compat for any configured provider
         if pcfg and pcfg.type == "openai_compat":
@@ -82,6 +84,21 @@ class ProviderRegistry:
     def _make_anthropic(pcfg: ProviderConfig | None, name: str) -> LLMProvider:
         from ccos.providers.anthropic import AnthropicProvider
         kwargs: dict = {}
+
+        # Check for OAuth token first
+        try:
+            from ccos.auth import load_credentials, get_valid_oauth_token
+            creds = load_credentials()
+            oauth_token = get_valid_oauth_token(creds)
+            if oauth_token:
+                kwargs["oauth_token"] = oauth_token
+                if pcfg and pcfg.base_url:
+                    kwargs["base_url"] = pcfg.base_url
+                return AnthropicProvider(**kwargs)
+        except Exception:
+            pass
+
+        # Fall back to API key
         key = ProviderRegistry._resolve_key(pcfg, name)
         if key:
             kwargs["api_key"] = key
@@ -107,6 +124,17 @@ class ProviderRegistry:
         if pcfg and pcfg.base_url:
             kwargs["base_url"] = pcfg.base_url
         return OllamaProvider(**kwargs)
+
+    @staticmethod
+    def _make_llamacpp(pcfg: ProviderConfig | None) -> LLMProvider:
+        from ccos.providers.llamacpp import LlamaCppProvider
+        kwargs: dict = {}
+        if pcfg and pcfg.base_url:
+            kwargs["base_url"] = pcfg.base_url
+        key = ProviderRegistry._resolve_key(pcfg, "llamacpp")
+        if key:
+            kwargs["api_key"] = key
+        return LlamaCppProvider(**kwargs)
 
     @staticmethod
     def _make_openai_compat(pcfg: ProviderConfig, name: str) -> LLMProvider:

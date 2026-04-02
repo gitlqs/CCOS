@@ -111,12 +111,17 @@ class Config:
                     api_key_env="XAI_API_KEY",
                     default_model="grok-3",
                 ),
+                "llamacpp": ProviderConfig(
+                    base_url="http://localhost:8080/v1",
+                    default_model="local-model",
+                ),
             },
         )
 
     @classmethod
     def _from_dict(cls, d: dict[str, Any]) -> Config:
-        providers: dict[str, ProviderConfig] = {}
+        # Start with defaults so newly added built-in providers are always present
+        providers: dict[str, ProviderConfig] = dict(cls._default().providers)
         for k, v in d.get("providers", {}).items():
             providers[k] = ProviderConfig(**{
                 f: v[f] for f in ProviderConfig.__dataclass_fields__ if f in v
