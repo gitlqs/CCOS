@@ -365,6 +365,10 @@ class OpenAICompatProvider(LLMProvider):
         # Track partial tool calls during streaming
         partial_tool_calls: dict[int, ToolCallContent] = {}
         partial_args: dict[int, str] = {}
+        # Remember the stop reason from the finish_reason chunk so the
+        # trailing usage-only chunk doesn't overwrite it.
+        resolved_stop: str | None = None
+        done_emitted = False
 
         response = await self._client.chat.completions.create(**params)
 
@@ -373,14 +377,16 @@ class OpenAICompatProvider(LLMProvider):
                 choice = chunk.choices[0] if chunk.choices else None
 
                 if choice is None:
-                    # Usage-only chunk at the end
+                    # Usage-only chunk at the end — use the saved stop reason
                     if chunk.usage:
+                        stop = resolved_stop or ("tool_use" if partial_tool_calls else "end_turn")
                         yield StreamChunk(
                             type=ChunkType.DONE,
-                            stop_reason="end_turn" if not partial_tool_calls else "tool_use",
+                            stop_reason=stop,
                             input_tokens=chunk.usage.prompt_tokens or 0,
                             output_tokens=chunk.usage.completion_tokens or 0,
                         )
+                        done_emitted = True
                     continue
 
                 delta = choice.delta
@@ -422,19 +428,20 @@ class OpenAICompatProvider(LLMProvider):
                         yield StreamChunk(type=ChunkType.TOOL_CALL_END, tool_call=tc)
 
                     if finish_reason == "tool_calls":
-                        stop = "tool_use"
+                        resolved_stop = "tool_use"
                     elif finish_reason == "length":
-                        stop = "length"
+                        resolved_stop = "length"
                     else:
-                        stop = "end_turn"
-                    # Don't yield DONE here — wait for the usage chunk
-                    if not chunk.usage:
-                        yield StreamChunk(
-                            type=ChunkType.DONE,
-                            stop_reason=stop,
-                            input_tokens=0,
-                            output_tokens=0,
-                        )
+                        resolved_stop = "end_turn"
+
+            # If stream ended without a usage chunk, emit DONE now
+            if not done_emitted:
+                yield StreamChunk(
+                    type=ChunkType.DONE,
+                    stop_reason=resolved_stop or "end_turn",
+                    input_tokens=0,
+                    output_tokens=0,
+                )
         finally:
             # Explicitly close the OpenAI SDK stream to release the
             # underlying httpx connection.
@@ -533,9 +540,33 @@ class OpenAICompatProvider(LLMProvider):
                     if usage:
                         input_tokens = getattr(usage, "input_tokens", 0) or 0
                         output_tokens = getattr(usage, "output_tokens", 0) or 0
+                    # Check the response status for truncation
+                    status = getattr(resp, "status", "completed")
+                    if status == "incomplete":
+                        stop = "length"
+                    elif has_tool_calls:
+                        stop = "tool_use"
+                    else:
+                        stop = "end_turn"
                     yield StreamChunk(
                         type=ChunkType.DONE,
-                        stop_reason="tool_use" if has_tool_calls else "end_turn",
+                        stop_reason=stop,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
+
+                # -- Response incomplete (truncated) --
+                elif etype == "response.incomplete":
+                    resp = event.response
+                    usage = getattr(resp, "usage", None)
+                    input_tokens = 0
+                    output_tokens = 0
+                    if usage:
+                        input_tokens = getattr(usage, "input_tokens", 0) or 0
+                        output_tokens = getattr(usage, "output_tokens", 0) or 0
+                    yield StreamChunk(
+                        type=ChunkType.DONE,
+                        stop_reason="length",
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                     )
