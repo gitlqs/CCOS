@@ -46,6 +46,12 @@ from ccos import __version__
     default=None,
     help="Resume a previous session by ID",
 )
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Enable verbose debug logging",
+)
 def cli(
     prompt: tuple[str, ...],
     model: str | None,
@@ -53,6 +59,7 @@ def cli(
     cwd: str | None,
     dangerously_skip_permissions: bool,
     resume: str | None,
+    verbose: bool,
 ) -> None:
     """CCOS - Production-grade agentic coding CLI.
 
@@ -65,6 +72,13 @@ def cli(
         ccos -p openai -m gpt-4o "hello"      # Use OpenAI
         ccos -p ollama -m llama3.1 "hello"    # Use Ollama
     """
+    import logging
+    if verbose or os.environ.get("CCOS_DEBUG"):
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(name)s %(levelname)s: %(message)s",
+        )
+
     from ccos.app import App
 
     try:
