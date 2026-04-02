@@ -4,7 +4,7 @@ CCOS 是一个 Python agentic coding CLI。
 
 **核心特点：**
 
-- **多模型支持** — Anthropic Claude、OpenAI GPT、Grok、Ollama 等任意 LLM
+- **多模型支持** — Anthropic Claude、OpenAI GPT、Google Gemini、Grok、Ollama 等任意 LLM
 - **完整 Agentic Loop** — 流式响应 → 工具调用 → 执行 → 反馈循环，最多 50 轮
 - **19 个内置工具** — 文件读写、Bash 执行、代码搜索、Web 抓取等
 - **Skill 插件系统** — 支持自定义 Slash 命令（/技能名），通过 `/skills` 管理技能插件
@@ -48,6 +48,7 @@ set PYTHONIOENCODING=utf-8
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."    # Claude
 export OPENAI_API_KEY="sk-..."           # OpenAI
+export GEMINI_API_KEY="..."              # Gemini
 export XAI_API_KEY="xai-..."             # Grok
 ```
 
@@ -67,6 +68,7 @@ ccos
   "providers": {
     "anthropic": { "api_key_env": "ANTHROPIC_API_KEY" },
     "openai": { "api_key_env": "OPENAI_API_KEY", "default_model": "gpt-4o" },
+    "gemini": { "api_key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta", "default_model": "gemini-2.5-flash" },
     "ollama": { "base_url": "http://localhost:11434/v1", "default_model": "llama3.1" },
     "grok": { "type": "openai_compat", "base_url": "https://api.x.ai/v1", "api_key_env": "XAI_API_KEY", "default_model": "grok-3" }
   }
@@ -87,6 +89,7 @@ ccos "explain this codebase"
 
 # 指定模型和提供商
 ccos -p openai -m gpt-4o "hello"
+ccos -p gemini -m gemini-2.5-flash "hello"
 ccos -p ollama -m llama3.1 "hello"
 
 # 恢复上次会话
@@ -102,7 +105,7 @@ Usage: ccos [OPTIONS] [PROMPT]...
 
 Options:
   -m, --model TEXT               模型名称 (e.g. claude-sonnet-4-6, gpt-4o)
-  -p, --provider TEXT            提供商 (anthropic, openai, ollama, grok)
+  -p, --provider TEXT            提供商 (anthropic, openai, gemini, ollama, grok)
   --cwd TEXT                     工作目录（默认当前目录）
   --dangerously-skip-permissions 跳过所有权限检查
   -r, --resume TEXT              恢复之前的会话 ID
@@ -131,7 +134,7 @@ Options:
 | 命令                 | 说明                   |
 | ------------------ | -------------------- |
 | `/model [name]`    | 切换/显示当前模型            |
-| `/provider [name]` | 切换/显示提供商（动态查询可用模型列表） |
+| `/provider [name]` | 切换/显示提供商（如 anthropic / openai / gemini / ollama / grok，动态查询可用模型列表） |
 | `/cost`            | 显示 token 用量和费用       |
 
 ### 会话管理
@@ -202,6 +205,7 @@ ccos/
     │   ├── registry.py          #   ProviderRegistry 工厂
     │   ├── anthropic.py         #   Claude API (直连/Bedrock/Vertex)
     │   ├── openai.py            #   OpenAI API
+    │   ├── gemini.py            #   Gemini REST API
     │   ├── openai_compat.py     #   通用 OpenAI 兼容接口
     │   └── ollama.py            #   本地 Ollama
     │
