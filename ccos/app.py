@@ -204,7 +204,18 @@ class App:
     def _run_async(self, coro) -> Any:
         """Run a coroutine on the persistent event loop."""
         loop = self._get_loop()
-        result = loop.run_until_complete(coro)
+        task = loop.create_task(coro)
+        try:
+            result = loop.run_until_complete(task)
+        except KeyboardInterrupt:
+            # Cancel the task and suppress its exception so asyncio
+            # doesn't emit "Task exception was never retrieved".
+            task.cancel()
+            try:
+                loop.run_until_complete(task)
+            except (asyncio.CancelledError, KeyboardInterrupt, Exception):
+                pass
+            raise
         # Force GC now so async-generator finalization tasks are created
         # while the loop is still accessible, then drain them immediately.
         gc.collect()
