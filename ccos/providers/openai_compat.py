@@ -22,23 +22,35 @@ from ccos.providers.base import (
 )
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Check if a model is an OpenAI reasoning model (o-series)."""
+    # Match o1, o1-mini, o1-preview, o3, o3-mini, o4-mini, etc.
+    # but not gpt-4o, gpt-4o-mini which start with "gpt-"
+    return model.split("-")[0] in ("o1", "o3", "o4")
+
+
 def _messages_to_openai(
     messages: list[Message],
     system: str | list[str],
+    *,
+    model: str = "",
 ) -> list[dict[str, Any]]:
     """Convert internal messages → OpenAI chat format.
 
     Key differences from Anthropic:
-    - System prompt is a message with role='system'
+    - System prompt is a message with role='system' (or 'developer' for reasoning models)
     - tool_use  → assistant message with tool_calls array
     - tool_result → message with role='tool'
     """
     out: list[dict[str, Any]] = []
 
+    # Reasoning models (o1-2024-12-17+, o3, o4) use 'developer' role instead of 'system'
+    sys_role = "developer" if _is_reasoning_model(model) else "system"
+
     # System message
     sys_text = "\n\n".join(system) if isinstance(system, list) else system
     if sys_text:
-        out.append({"role": "system", "content": sys_text})
+        out.append({"role": sys_role, "content": sys_text})
 
     for msg in messages:
         if isinstance(msg.content, str):
@@ -169,15 +181,23 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float | None = None,
         thinking: ThinkingConfig | None = None,
     ) -> AsyncIterator[StreamChunk]:
+        reasoning = _is_reasoning_model(model)
+
         params: dict[str, Any] = {
             "model": model,
-            "messages": _messages_to_openai(messages, system),
-            "max_tokens": max_tokens,
+            "messages": _messages_to_openai(messages, system, model=model),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if temperature is not None:
-            params["temperature"] = temperature
+
+        if reasoning:
+            # Reasoning models use max_completion_tokens and don't support temperature
+            params["max_completion_tokens"] = max_tokens
+        else:
+            params["max_tokens"] = max_tokens
+            if temperature is not None:
+                params["temperature"] = temperature
+
         if tools:
             params["tools"] = _tools_to_openai(tools)
 
