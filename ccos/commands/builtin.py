@@ -49,6 +49,18 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             console.print(f"Model switched to: [cyan]{app.model}[/cyan]")
         else:
             console.print(f"Current model: [cyan]{app.model}[/cyan]")
+            console.print(f"Provider: [dim]{app.engine.provider.name}[/dim]")
+            try:
+                models = asyncio.run(app.engine.provider.list_models())
+            except Exception:
+                models = []
+            if models:
+                console.print(f"\n[dim]Available models ({len(models)}):[/dim]")
+                for m in models:
+                    marker = " [yellow]◀ current[/yellow]" if m == app.model else ""
+                    console.print(f"  [cyan]{m}[/cyan]{marker}")
+            else:
+                console.print("[dim](Provider did not return a model list)[/dim]")
 
     def cmd_provider(args: str = "", **_: Any) -> None:
         console = Console()
@@ -99,10 +111,20 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             except ValueError as e:
                 console.print(f"[red]{e}[/red]")
         else:
-            console.print(f"Current provider: [cyan]{app.engine.provider.name}[/cyan]")
+            current = app.engine.provider.name
+            table = Table(title="Providers", border_style="dim", show_header=True)
+            table.add_column("", width=2)
+            table.add_column("Provider", style="cyan")
+            table.add_column("Default Model", style="dim")
+            table.add_column("Base URL", style="dim")
+            for pname, pcfg in app.config.providers.items():
+                marker = "[yellow]▶[/yellow]" if pname == current else ""
+                model_str = pcfg.default_model or "-"
+                url_str = pcfg.base_url or "-"
+                table.add_row(marker, pname, model_str, url_str)
+            console.print(table)
             console.print(f"Current model: [cyan]{app.model}[/cyan]")
-            available = list(app.config.providers.keys())
-            console.print(f"[dim]Available providers: {', '.join(available)}[/dim]")
+            console.print(f"[dim]Use /provider <name> to switch.[/dim]")
 
     def cmd_cost(**_: Any) -> None:
         Console().print(app.engine.cost.summary())
@@ -470,24 +492,116 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             for prov, key in creds.api_keys.items():
                 masked = key[:8] + "..." + key[-4:] if len(key) > 16 else "***"
                 console.print(f"  {prov}: [green]{masked}[/green]")
-            if creds.oauth_account:
-                console.print(f"  OAuth: [green]{creds.oauth_account.email}[/green]")
+            if creds.oauth_token:
+                acct_label = creds.oauth_account.email if creds.oauth_account else "logged in"
+                import time as _time
+                if creds.oauth_expires_at:
+                    remaining = creds.oauth_expires_at - _time.time()
+                    if remaining > 0:
+                        hours = int(remaining // 3600)
+                        mins = int((remaining % 3600) // 60)
+                        expiry = f", expires in {hours}h{mins}m"
+                    else:
+                        expiry = ", [yellow]expired[/yellow]"
+                else:
+                    expiry = ""
+                console.print(f"  Anthropic OAuth: [green]{acct_label}[/green]{expiry}")
             console.print()
 
-        # Ask which provider
-        console.print("[bold]Add or update API key[/bold]")
-        console.print("  1. Anthropic (Claude)")
-        console.print("  2. OpenAI (GPT-4o, o1, etc.)")
-        console.print("  3. xAI / Grok")
-        console.print("  4. Custom provider")
+        # Ask which provider / method
+        console.print("[bold]Sign in[/bold]")
+        console.print("  1. Anthropic — API key (sk-ant-...)")
+        console.print("  2. Anthropic — OAuth (Claude.ai browser login, Pro/Max subscription)")
+        console.print("  3. OpenAI (GPT-4o, o1, etc.)")
+        console.print("  4. xAI / Grok")
+        console.print("  5. Custom provider")
         console.print()
 
         try:
-            choice = console.input("[yellow]Provider (1-4): [/yellow]").strip()
+            choice = console.input("[yellow]Choice (1-5): [/yellow]").strip()
         except (EOFError, KeyboardInterrupt):
             return
 
-        provider_map = {"1": "anthropic", "2": "openai", "3": "grok", "4": "custom"}
+        # ── Option 2: Anthropic OAuth ──────────────────────────────────────
+        if choice == "2":
+            from ccos.auth import build_oauth_url, exchange_oauth_code, OAuthAccount
+            import time as _time
+
+            url, code_verifier, state = build_oauth_url()
+
+            console.print()
+            console.print("[bold]Anthropic OAuth Login[/bold]")
+            console.print("[dim]Open the following URL in your browser to log in:[/dim]")
+            console.print()
+            console.print(f"  [cyan]{url}[/cyan]")
+            console.print()
+            console.print("[dim]After logging in, you'll see a page showing your authorization code.[/dim]")
+            console.print("[dim]Copy the full code (including any # suffix) and paste it below.[/dim]")
+            console.print()
+
+            try:
+                raw_code = console.input("[yellow]Paste authorization code: [/yellow]").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+
+            if not raw_code:
+                console.print("[red]No code entered.[/red]")
+                return
+
+            # Split code and state (format: {code}#{state})
+            if "#" in raw_code:
+                auth_code, returned_state = raw_code.split("#", 1)
+                if returned_state != state:
+                    console.print("[red]State mismatch — possible CSRF attack. Aborting.[/red]")
+                    return
+            else:
+                auth_code = raw_code
+
+            console.print("[dim]Exchanging code for tokens...[/dim]")
+            try:
+                token_data = asyncio.run(exchange_oauth_code(auth_code, code_verifier, state))
+            except Exception as e:
+                console.print(f"[red]Token exchange failed: {e}[/red]")
+                return
+
+            access_token = token_data.get("access_token", "")
+            refresh_token = token_data.get("refresh_token", "")
+            expires_in = token_data.get("expires_in", 28800)
+
+            if not access_token:
+                console.print("[red]No access token received.[/red]")
+                return
+
+            creds.oauth_token = access_token
+            creds.oauth_refresh_token = refresh_token
+            creds.oauth_expires_at = _time.time() + expires_in
+
+            acct_data = token_data.get("account", {})
+            org_data = token_data.get("organization", {})
+            creds.oauth_account = OAuthAccount(
+                email=acct_data.get("email_address", ""),
+                display_name=org_data.get("name", ""),
+                organization_id=org_data.get("uuid", ""),
+            )
+            save_credentials(creds)
+
+            email = creds.oauth_account.email or "unknown"
+            console.print(f"[green]Logged in as {email}. OAuth token saved.[/green]")
+
+            # Refresh provider
+            try:
+                from ccos.providers.registry import ProviderRegistry
+                app.provider = ProviderRegistry().get_provider(
+                    app.config, provider_name="anthropic",
+                )
+                app.engine.provider = app.provider
+                console.print("[dim]Provider refreshed with OAuth token.[/dim]")
+            except Exception:
+                pass
+            return
+
+        # ── Options 1, 3-5: API key login ─────────────────────────────────
+        provider_map = {"1": "anthropic", "3": "openai", "4": "grok", "5": "custom"}
         provider = provider_map.get(choice)
         if not provider:
             console.print("[red]Invalid choice.[/red]")
@@ -519,7 +633,6 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
 
         # Verify
         console.print("[dim]Verifying...[/dim]")
-        import asyncio
         success, msg = asyncio.run(verify_api_key(provider, api_key))
         if success:
             console.print(f"[green]{msg}[/green]")

@@ -293,12 +293,6 @@ class App:
                     if user_input is None:
                         # Ctrl+D — exit
                         self.renderer.print_status("Goodbye!")
-                        self.status_bar.render(
-                            model=self.model,
-                            provider=self.provider.name,
-                            cost_tracker=self.engine.cost,
-                            cwd=self.cwd,
-                        )
                         break
 
                     if not user_input:
