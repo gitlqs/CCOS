@@ -1,4 +1,10 @@
-"""OpenAI-compatible provider — works with OpenAI, Grok, and any compatible API."""
+"""OpenAI-compatible provider — works with OpenAI, Grok, and any compatible API.
+
+Supports three API paths:
+- Chat Completions (``/v1/chat/completions``) — GPT-4o, GPT-4.1, etc.
+- Chat Completions reasoning mode — o-series, GPT-5 series (``max_completion_tokens``)
+- Responses API (``/v1/responses``) — Codex models (``gpt-5.x-codex*``)
+"""
 
 from __future__ import annotations
 
@@ -22,12 +28,43 @@ from ccos.providers.base import (
 )
 
 
-def _is_reasoning_model(model: str) -> bool:
-    """Check if a model is an OpenAI reasoning model (o-series)."""
-    # Match o1, o1-mini, o1-preview, o3, o3-mini, o4-mini, etc.
-    # but not gpt-4o, gpt-4o-mini which start with "gpt-"
-    return model.split("-")[0] in ("o1", "o3", "o4")
+# ---------------------------------------------------------------------------
+# Model classification helpers
+# ---------------------------------------------------------------------------
 
+def _is_reasoning_model(model: str) -> bool:
+    """Check if a model is an OpenAI reasoning model.
+
+    Reasoning models require max_completion_tokens (not max_tokens),
+    use the 'developer' role (not 'system'), and don't support temperature.
+
+    Includes:
+    - o-series: o1, o1-mini, o3, o3-mini, o4-mini, etc.
+    - GPT-5 series: gpt-5, gpt-5-mini, gpt-5.1, gpt-5.4, etc.
+    """
+    # o-series: o1, o3, o4 (but not gpt-4o which starts with "gpt-")
+    first = model.split("-")[0]
+    if first in ("o1", "o3", "o4"):
+        return True
+    # GPT-5 series: gpt-5, gpt-5-mini, gpt-5.1, gpt-5.2, gpt-5.4, etc.
+    if model.startswith("gpt-5"):
+        return True
+    return False
+
+
+def _is_responses_model(model: str) -> bool:
+    """Check if a model requires the Responses API instead of Chat Completions.
+
+    Codex models (gpt-5.x-codex, codex-mini-latest, etc.) are not chat models
+    and must use ``/v1/responses``.
+    """
+    lower = model.lower()
+    return "codex" in lower
+
+
+# ---------------------------------------------------------------------------
+# Chat Completions message/tool conversion
+# ---------------------------------------------------------------------------
 
 def _messages_to_openai(
     messages: list[Message],
@@ -35,16 +72,16 @@ def _messages_to_openai(
     *,
     model: str = "",
 ) -> list[dict[str, Any]]:
-    """Convert internal messages → OpenAI chat format.
+    """Convert internal messages -> OpenAI chat format.
 
     Key differences from Anthropic:
     - System prompt is a message with role='system' (or 'developer' for reasoning models)
-    - tool_use  → assistant message with tool_calls array
-    - tool_result → message with role='tool'
+    - tool_use  -> assistant message with tool_calls array
+    - tool_result -> message with role='tool'
     """
     out: list[dict[str, Any]] = []
 
-    # Reasoning models (o1-2024-12-17+, o3, o4) use 'developer' role instead of 'system'
+    # Reasoning models (o1-2024-12-17+, o3, o4, gpt-5) use 'developer' role
     sys_role = "developer" if _is_reasoning_model(model) else "system"
 
     # System message
@@ -138,6 +175,95 @@ def _tools_to_openai(tools: list[ToolSchema]) -> list[dict[str, Any]]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Responses API message/tool conversion
+# ---------------------------------------------------------------------------
+
+def _messages_to_responses(
+    messages: list[Message],
+) -> list[dict[str, Any]]:
+    """Convert internal messages -> Responses API input array.
+
+    The Responses API input format:
+    - User text:          {"role": "user", "content": "..."}
+    - Assistant text:     {"role": "assistant", "content": [{"type": "output_text", "text": "..."}]}
+    - Tool calls:         {"type": "function_call", "call_id": "...", "name": "...", "arguments": "..."}
+    - Tool results:       {"type": "function_call_output", "call_id": "...", "output": "..."}
+    """
+    out: list[dict[str, Any]] = []
+
+    for msg in messages:
+        if isinstance(msg.content, str):
+            out.append({"role": msg.role, "content": msg.content})
+            continue
+
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        tool_results: list[dict[str, Any]] = []
+
+        for block in msg.content:
+            if isinstance(block, TextContent):
+                text_parts.append(block.text)
+            elif isinstance(block, ToolCallContent):
+                tool_calls.append({
+                    "type": "function_call",
+                    "call_id": block.id,
+                    "name": block.name,
+                    "arguments": json.dumps(block.input),
+                })
+            elif isinstance(block, ToolResultContent):
+                content_str = block.content if isinstance(block.content, str) else \
+                    " ".join(c.text for c in block.content if isinstance(c, TextContent))
+                tool_results.append({
+                    "type": "function_call_output",
+                    "call_id": block.tool_use_id,
+                    "output": content_str,
+                })
+
+        if msg.role == "assistant":
+            # Emit assistant text as a message item
+            if text_parts:
+                text = "".join(text_parts)
+                out.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                })
+            # Emit tool calls as individual function_call items
+            for tc in tool_calls:
+                out.append(tc)
+        elif msg.role == "user":
+            # Emit tool results first
+            for tr in tool_results:
+                out.append(tr)
+            # Then user text
+            if text_parts:
+                out.append({"role": "user", "content": "".join(text_parts)})
+
+    return out
+
+
+def _tools_to_responses(tools: list[ToolSchema]) -> list[dict[str, Any]]:
+    """Convert tool schemas -> Responses API tool format.
+
+    Key difference from Chat Completions: name/description/parameters are
+    top-level fields, NOT nested under a 'function' key.
+    """
+    return [
+        {
+            "type": "function",
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.input_schema,
+        }
+        for t in tools
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Provider
+# ---------------------------------------------------------------------------
+
 class OpenAICompatProvider(LLMProvider):
     """Provider for OpenAI and any OpenAI-compatible API."""
 
@@ -180,6 +306,41 @@ class OpenAICompatProvider(LLMProvider):
         max_tokens: int = 16384,
         temperature: float | None = None,
         thinking: ThinkingConfig | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        if _is_responses_model(model):
+            async for chunk in self._stream_responses(
+                messages=messages,
+                system=system,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                yield chunk
+        else:
+            async for chunk in self._stream_chat(
+                messages=messages,
+                system=system,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ):
+                yield chunk
+
+    # ------------------------------------------------------------------
+    # Chat Completions streaming (GPT-4o, GPT-5, o-series, etc.)
+    # ------------------------------------------------------------------
+
+    async def _stream_chat(
+        self,
+        *,
+        messages: list[Message],
+        system: str | list[str],
+        tools: list[ToolSchema] | None = None,
+        model: str,
+        max_tokens: int = 16384,
+        temperature: float | None = None,
     ) -> AsyncIterator[StreamChunk]:
         reasoning = _is_reasoning_model(model)
 
@@ -260,7 +421,12 @@ class OpenAICompatProvider(LLMProvider):
                             tc.input = {}
                         yield StreamChunk(type=ChunkType.TOOL_CALL_END, tool_call=tc)
 
-                    stop = "tool_use" if finish_reason == "tool_calls" else "end_turn"
+                    if finish_reason == "tool_calls":
+                        stop = "tool_use"
+                    elif finish_reason == "length":
+                        stop = "length"
+                    else:
+                        stop = "end_turn"
                     # Don't yield DONE here — wait for the usage chunk
                     if not chunk.usage:
                         yield StreamChunk(
@@ -271,8 +437,122 @@ class OpenAICompatProvider(LLMProvider):
                         )
         finally:
             # Explicitly close the OpenAI SDK stream to release the
-            # underlying httpx connection. Without this, GC of the
-            # stream object schedules an async_generator_athrow task
-            # that never runs, producing:
-            #   "Task was destroyed but it is pending!"
+            # underlying httpx connection.
             await response.close()
+
+    # ------------------------------------------------------------------
+    # Responses API streaming (Codex models)
+    # ------------------------------------------------------------------
+
+    async def _stream_responses(
+        self,
+        *,
+        messages: list[Message],
+        system: str | list[str],
+        tools: list[ToolSchema] | None = None,
+        model: str,
+        max_tokens: int = 16384,
+        temperature: float | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Stream using the Responses API (``/v1/responses``).
+
+        Used for Codex models and any model that doesn't support Chat Completions.
+        """
+        sys_text = "\n\n".join(system) if isinstance(system, list) else system
+
+        params: dict[str, Any] = {
+            "model": model,
+            "input": _messages_to_responses(messages),
+            "stream": True,
+            "max_output_tokens": max_tokens,
+        }
+
+        if sys_text:
+            params["instructions"] = sys_text
+
+        if temperature is not None:
+            params["temperature"] = temperature
+
+        if tools:
+            params["tools"] = _tools_to_responses(tools)
+
+        # Track in-flight function calls by item_id
+        pending_calls: dict[str, ToolCallContent] = {}
+        pending_args: dict[str, str] = {}
+        has_tool_calls = False
+
+        response = await self._client.responses.create(**params)
+
+        try:
+            async for event in response:
+                etype = event.type
+
+                # -- Text delta --
+                if etype == "response.output_text.delta":
+                    yield StreamChunk(type=ChunkType.TEXT, text=event.delta)
+
+                # -- Function call: new item added --
+                elif etype == "response.output_item.added":
+                    item = event.item
+                    if getattr(item, "type", None) == "function_call":
+                        call_id = getattr(item, "call_id", "") or f"call_{uuid.uuid4().hex[:24]}"
+                        name = getattr(item, "name", "") or ""
+                        tc = ToolCallContent(id=call_id, name=name)
+                        pending_calls[item.id] = tc
+                        pending_args[item.id] = ""
+                        has_tool_calls = True
+                        yield StreamChunk(type=ChunkType.TOOL_CALL_START, tool_call=tc)
+
+                # -- Function call arguments delta --
+                elif etype == "response.function_call_arguments.delta":
+                    item_id = event.item_id
+                    if item_id in pending_args:
+                        pending_args[item_id] += event.delta
+                        yield StreamChunk(type=ChunkType.TOOL_CALL_DELTA, text=event.delta)
+
+                # -- Function call arguments done --
+                elif etype == "response.function_call_arguments.done":
+                    item_id = event.item_id
+                    if item_id in pending_calls:
+                        tc = pending_calls[item_id]
+                        # Update with final values
+                        tc.name = getattr(event, "name", tc.name) or tc.name
+                        tc.id = getattr(event, "call_id", tc.id) or tc.id
+                        try:
+                            tc.input = json.loads(getattr(event, "arguments", "{}"))
+                        except json.JSONDecodeError:
+                            tc.input = {}
+                        yield StreamChunk(type=ChunkType.TOOL_CALL_END, tool_call=tc)
+
+                # -- Response completed (has usage) --
+                elif etype == "response.completed":
+                    resp = event.response
+                    usage = getattr(resp, "usage", None)
+                    input_tokens = 0
+                    output_tokens = 0
+                    if usage:
+                        input_tokens = getattr(usage, "input_tokens", 0) or 0
+                        output_tokens = getattr(usage, "output_tokens", 0) or 0
+                    yield StreamChunk(
+                        type=ChunkType.DONE,
+                        stop_reason="tool_use" if has_tool_calls else "end_turn",
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
+
+                # -- Response failed --
+                elif etype == "response.failed":
+                    resp = event.response
+                    error = getattr(resp, "error", None)
+                    error_msg = str(error) if error else "Unknown error"
+                    yield StreamChunk(type=ChunkType.ERROR, text=error_msg)
+                    yield StreamChunk(
+                        type=ChunkType.DONE,
+                        stop_reason="error",
+                        input_tokens=0,
+                        output_tokens=0,
+                    )
+
+        finally:
+            if hasattr(response, "close"):
+                await response.close()
