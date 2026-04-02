@@ -13,6 +13,7 @@ import json
 import os
 import stat
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +33,8 @@ class Credentials:
     api_keys: dict[str, str] = field(default_factory=dict)
     # OAuth (Anthropic Console)
     oauth_token: str = ""
+    oauth_refresh_token: str = ""
+    oauth_expires_at: float = 0.0  # Unix timestamp
     oauth_account: OAuthAccount | None = None
 
     def get_api_key(self, provider: str) -> str | None:
@@ -51,6 +54,14 @@ class Credentials:
         if env_var:
             return os.environ.get(env_var)
         return None
+
+    def is_oauth_token_valid(self) -> bool:
+        """Return True if oauth_token exists and hasn't expired (with 60s buffer)."""
+        if not self.oauth_token:
+            return False
+        if self.oauth_expires_at and time.time() >= self.oauth_expires_at - 60:
+            return False
+        return True
 
     def has_any_key(self) -> bool:
         """Check if any credentials are available."""
@@ -82,6 +93,8 @@ def load_credentials() -> Credentials:
         creds = Credentials()
         creds.api_keys = data.get("api_keys", {})
         creds.oauth_token = data.get("oauth_token", "")
+        creds.oauth_refresh_token = data.get("oauth_refresh_token", "")
+        creds.oauth_expires_at = data.get("oauth_expires_at", 0.0)
         acct = data.get("oauth_account")
         if acct:
             creds.oauth_account = OAuthAccount(
@@ -100,6 +113,8 @@ def save_credentials(creds: Credentials) -> None:
     data: dict[str, Any] = {
         "api_keys": creds.api_keys,
         "oauth_token": creds.oauth_token,
+        "oauth_refresh_token": creds.oauth_refresh_token,
+        "oauth_expires_at": creds.oauth_expires_at,
     }
     if creds.oauth_account:
         data["oauth_account"] = {
@@ -167,3 +182,152 @@ async def verify_api_key(provider: str, api_key: str) -> tuple[bool, str]:
 
     else:
         return True, f"Key saved for {provider} (no verification available)."
+
+
+# ── Anthropic OAuth (PKCE) ─────────────────────────────────────────────────
+
+_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
+_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+
+
+def _generate_pkce_pair() -> tuple[str, str, str]:
+    """Return (code_verifier, code_challenge, state) using S256.
+
+    Per the Anthropic Claude Code OAuth spec, state must equal code_verifier.
+    """
+    import base64
+    import hashlib
+    import secrets
+
+    verifier_bytes = secrets.token_bytes(32)
+    code_verifier = base64.urlsafe_b64encode(verifier_bytes).rstrip(b"=").decode()
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    # state must equal code_verifier in the Claude Code OAuth flow
+    state = code_verifier
+    return code_verifier, code_challenge, state
+
+
+def build_oauth_url() -> tuple[str, str, str]:
+    """Build the OAuth authorization URL.
+
+    Returns (url, code_verifier, state).
+    """
+    import urllib.parse
+
+    code_verifier, code_challenge, state = _generate_pkce_pair()
+
+    params = {
+        "code": "true",
+        "client_id": _OAUTH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": _OAUTH_REDIRECT_URI,
+        "scope": _OAUTH_SCOPES,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    url = _OAUTH_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+    return url, code_verifier, state
+
+
+async def exchange_oauth_code(
+    code: str,
+    code_verifier: str,
+    state: str,
+) -> dict[str, Any]:
+    """Exchange an authorization code for tokens.
+
+    Returns the parsed JSON response dict on success, raises on error.
+    The ``code`` should already have the ``#{state}`` suffix stripped.
+    """
+    import urllib.request
+
+    payload = json.dumps({
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": _OAUTH_CLIENT_ID,
+        "redirect_uri": _OAUTH_REDIRECT_URI,
+        "code_verifier": code_verifier,
+        "state": state,
+    }).encode()
+
+    req = urllib.request.Request(
+        _OAUTH_TOKEN_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "anthropic",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+async def refresh_oauth_token(creds: Credentials) -> tuple[bool, str]:
+    """Use the stored refresh token to get a new access token.
+
+    Updates *creds* in-place on success (caller must call save_credentials).
+    Returns (success, message).
+    """
+    if not creds.oauth_refresh_token:
+        return False, "No refresh token stored."
+
+    import urllib.request
+    import urllib.error
+
+    payload = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": creds.oauth_refresh_token,
+        "client_id": _OAUTH_CLIENT_ID,
+    }).encode()
+
+    try:
+        req = urllib.request.Request(
+            _OAUTH_TOKEN_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "anthropic",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        return False, f"Token refresh failed ({e.code}): {body}"
+    except Exception as e:
+        return False, f"Token refresh error: {e}"
+
+    creds.oauth_token = data.get("access_token", "")
+    creds.oauth_refresh_token = data.get("refresh_token", creds.oauth_refresh_token)
+    expires_in = data.get("expires_in", 28800)
+    creds.oauth_expires_at = time.time() + expires_in
+    return True, "Token refreshed successfully."
+
+
+def get_valid_oauth_token(creds: Credentials) -> str | None:
+    """Return a valid OAuth access token, refreshing synchronously if needed.
+
+    Returns None if no token is available or refresh fails.
+    """
+    if not creds.oauth_token:
+        return None
+    if creds.is_oauth_token_valid():
+        return creds.oauth_token
+    # Try to refresh
+    import asyncio
+    try:
+        ok, _ = asyncio.get_event_loop().run_until_complete(refresh_oauth_token(creds))
+    except RuntimeError:
+        # No running loop; create a temporary one
+        ok, _ = asyncio.run(refresh_oauth_token(creds))
+    if ok:
+        save_credentials(creds)
+        return creds.oauth_token
+    return None

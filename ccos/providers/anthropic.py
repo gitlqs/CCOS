@@ -95,14 +95,23 @@ class AnthropicProvider(LLMProvider):
         base_url: str | None = None,
         timeout: float = 600.0,
         max_retries: int = 2,
+        oauth_token: str | None = None,
     ):
         import anthropic
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        self._oauth_token = oauth_token
         kwargs: dict[str, Any] = {
-            "api_key": self._api_key,
             "timeout": timeout,
             "max_retries": max_retries,
         }
+        if oauth_token:
+            # OAuth Bearer token — use auth_token parameter
+            kwargs["auth_token"] = oauth_token
+            kwargs["default_headers"] = {
+                "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+            }
+        else:
+            self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+            kwargs["api_key"] = self._api_key
         if base_url:
             kwargs["base_url"] = base_url
         self._client = anthropic.AsyncAnthropic(**kwargs)
