@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, AsyncIterator, Callable
 
@@ -18,6 +19,7 @@ from ccos.providers.base import (
     ChunkType,
     LLMProvider,
     LLMResponse,
+    Message,
     StreamChunk,
     TextContent,
     ThinkingConfig,
@@ -27,9 +29,19 @@ from ccos.providers.base import (
 )
 from ccos.tools.base import ToolContext, ToolRegistry
 
+log = logging.getLogger(__name__)
+
 _MAX_TOOL_TURNS = 50  # Safety limit to prevent infinite loops
 _MAX_RETRIES = 3      # Max API retries on transient errors
 _RETRY_DELAYS = [1, 2, 4]  # Exponential backoff seconds
+
+# Output token budgets.
+# For reasoning models (o-series, GPT-5), max_completion_tokens includes
+# reasoning tokens, so we need a much higher budget to leave room for
+# actual output + tool calls after internal reasoning.
+_DEFAULT_MAX_TOKENS = 16_384           # Non-reasoning models (GPT-4o etc.)
+_REASONING_MAX_TOKENS = 65_536         # Reasoning models (o-series, GPT-5)
+_RESPONSES_MAX_TOKENS = 65_536         # Responses API models (Codex)
 
 # Error types that are retryable
 _RETRYABLE_ERRORS = (
@@ -153,9 +165,34 @@ class QueryEngine:
             # Get text from response
             final_text = response.get_text()
 
+            log.debug(
+                "turn=%d model=%s stop=%s in=%d out=%d tool_calls=%d text_len=%d",
+                turn, self.model, response.stop_reason,
+                response.input_tokens, response.output_tokens,
+                len(response.get_tool_calls()), len(final_text),
+            )
+
             # Check for tool calls
             tool_calls = response.get_tool_calls()
+
             if not tool_calls:
+                # If truncated (finish_reason=length), warn the user
+                if response.stop_reason == "length":
+                    trunc_msg = "\n[Response truncated — output token limit reached. Continuing...]\n"
+                    if self._on_text:
+                        self._on_text(trunc_msg)
+                    final_text += trunc_msg
+                    # Don't break — add to history and let the model continue
+                    # so it can re-attempt the tool call
+                    self.messages.messages[-1] = Message(
+                        role="assistant", content=[TextContent(text=final_text)]
+                    )
+                    self.messages.add_user(
+                        "Your previous response was truncated due to the output token limit. "
+                        "Please continue from where you left off. If you were about to call "
+                        "a tool, go ahead and call it now."
+                    )
+                    continue
                 break  # end_turn — no more tools to run
 
             # Notify UI about tool calls
@@ -222,16 +259,35 @@ class QueryEngine:
                     continue
                 else:
                     # Non-retryable or final attempt
+                    error_msg = f"\n\n[API Error: {e}]"
+                    if self._on_text:
+                        self._on_text(error_msg)
                     response = LLMResponse()
-                    response.content.append(TextContent(text=f"\n\n[API Error: {e}]"))
+                    response.content.append(TextContent(text=error_msg))
                     response.stop_reason = "error"
                     return response
 
         # Should not reach here, but just in case
+        error_msg = f"\n\n[API Error after {_MAX_RETRIES} retries: {last_error}]"
+        if self._on_text:
+            self._on_text(error_msg)
         response = LLMResponse()
-        response.content.append(TextContent(text=f"\n\n[API Error after {_MAX_RETRIES} retries: {last_error}]"))
+        response.content.append(TextContent(text=error_msg))
         response.stop_reason = "error"
         return response
+
+    def _get_max_tokens(self) -> int:
+        """Pick the output token budget based on the current model."""
+        from ccos.providers.openai_compat import _is_reasoning_model, _is_responses_model
+        model = self.model
+        try:
+            if _is_responses_model(model):
+                return _RESPONSES_MAX_TOKENS
+            if _is_reasoning_model(model):
+                return _REASONING_MAX_TOKENS
+        except Exception:
+            pass
+        return _DEFAULT_MAX_TOKENS
 
     async def _stream_response(
         self,
@@ -243,12 +299,14 @@ class QueryEngine:
         current_text = ""
         current_tool: ToolCallContent | None = None
 
+        max_tokens = self._get_max_tokens()
+
         stream = self.provider.stream(
             messages=self.messages.to_api_format(),
             system=system,
             tools=tool_schemas if tool_schemas else None,
             model=self.model,
-            max_tokens=16384,
+            max_tokens=max_tokens,
             thinking=self.thinking,
         )
 
