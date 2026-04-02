@@ -42,7 +42,8 @@ class BashTool(Tool):
         "- Read files: Use Read (NOT cat/head/tail)\n"
         "- Edit files: Use Edit (NOT sed/awk)\n"
         "- Write files: Use Write (NOT echo >/cat <<EOF)\n\n"
-        "Reserve Bash exclusively for system commands and terminal operations that require shell execution."
+        "Reserve Bash exclusively for system commands and terminal operations that require shell execution.\n\n"
+        "Before issuing commands, first verify terminal/OS type (macOS, Linux, or Windows) and then use the corresponding command syntax/tools for that environment."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
