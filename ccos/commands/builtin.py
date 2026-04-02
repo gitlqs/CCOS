@@ -45,20 +45,46 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             app.model = args.strip()
             app.engine.model = app.model
             app.config.default_model = app.model
+            pcfg = app.config.providers.get(app.engine.provider.name)
+            if pcfg:
+                pcfg.default_model = app.model
             app.config.save()
             console.print(f"Model switched to: [cyan]{app.model}[/cyan]")
         else:
             console.print(f"Current model: [cyan]{app.model}[/cyan]")
             console.print(f"Provider: [dim]{app.engine.provider.name}[/dim]")
+            console.print("[dim]Fetching available models...[/dim]")
             try:
-                models = asyncio.run(app.engine.provider.list_models())
+                models = app._run_async(app.engine.provider.list_models())
             except Exception:
                 models = []
             if models:
                 console.print(f"\n[dim]Available models ({len(models)}):[/dim]")
-                for m in models:
+                for i, m in enumerate(models, 1):
                     marker = " [yellow]◀ current[/yellow]" if m == app.model else ""
-                    console.print(f"  [cyan]{m}[/cyan]{marker}")
+                    console.print(f"  [dim]{i:>3}.[/dim] [cyan]{m}[/cyan]{marker}")
+                try:
+                    choice = console.input(
+                        f"\n[dim]Select model number (Enter to keep [cyan]{app.model}[/cyan]):[/dim] "
+                    )
+                    choice = choice.strip()
+                    if choice:
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(models):
+                            app.model = models[idx]
+                            app.engine.model = app.model
+                            app.config.default_model = app.model
+                            pcfg = app.config.providers.get(app.engine.provider.name)
+                            if pcfg:
+                                pcfg.default_model = app.model
+                            app.config.save()
+                            console.print(f"Model switched to: [cyan]{app.model}[/cyan]")
+                        else:
+                            console.print("[red]Invalid selection.[/red]")
+                except (EOFError, KeyboardInterrupt):
+                    console.print()
+                except ValueError:
+                    console.print("[red]Invalid input.[/red]")
             else:
                 console.print("[dim](Provider did not return a model list)[/dim]")
 
@@ -68,18 +94,24 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             name = args.strip()
             try:
                 from ccos.providers.registry import ProviderRegistry
-                provider = ProviderRegistry().get_provider(app.config, provider_name=name)
+                reg = ProviderRegistry()
+                provider = reg.get_provider(app.config, provider_name=name)
+                app.provider = provider
                 app.engine.provider = provider
 
                 # Query available models from provider API
-                default_model = ProviderRegistry().get_model(app.config, provider_name=name)
+                default_model = reg.get_model(app.config, provider_name=name)
+                console.print(f"Provider switched to: [cyan]{name}[/cyan]")
+                console.print("[dim]Fetching available models...[/dim]")
                 try:
-                    models = asyncio.run(provider.list_models())
+                    models = app._run_async(provider.list_models())
                 except Exception:
                     models = []
 
                 if models:
-                    console.print(f"Provider switched to: [cyan]{name}[/cyan]")
+                    # Auto-correct if default_model is not in the real model list
+                    if default_model not in models:
+                        default_model = models[0]
                     console.print(f"[dim]Available models ({len(models)}):[/dim]")
                     for i, m in enumerate(models, 1):
                         marker = " [yellow](default)[/yellow]" if m == default_model else ""
@@ -94,18 +126,19 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                             if 0 <= idx < len(models):
                                 default_model = models[idx]
                             else:
-                                console.print(f"[red]Invalid selection, using default.[/red]")
+                                console.print("[red]Invalid selection, using default.[/red]")
                     except (EOFError, KeyboardInterrupt):
                         console.print()
                     except ValueError:
-                        console.print(f"[red]Invalid input, using default.[/red]")
-                else:
-                    console.print(f"Provider switched to: [cyan]{name}[/cyan]")
+                        console.print("[red]Invalid input, using default.[/red]")
 
                 app.engine.model = default_model
                 app.model = default_model
                 app.config.default_provider = name
                 app.config.default_model = default_model
+                pcfg = app.config.providers.get(name)
+                if pcfg:
+                    pcfg.default_model = default_model
                 app.config.save()
                 console.print(f"Model: [cyan]{default_model}[/cyan]")
             except ValueError as e:
