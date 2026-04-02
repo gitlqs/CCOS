@@ -170,6 +170,7 @@ class App:
             on_tool_start=self.renderer.print_tool_call,
             on_tool_end=self.renderer.print_tool_result,
             on_thinking=self.renderer.print_thinking,
+            flush_streaming=self.renderer.flush_streaming,
             hooks=self.hooks,
             skill_registry=self.skill_registry,
             co_author=self.config.git.co_author,

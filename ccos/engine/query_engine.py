@@ -79,6 +79,7 @@ class QueryEngine:
         on_tool_start: Callable[[ToolCallContent], None] | None = None,
         on_tool_end: Callable[[str, str, bool], None] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        flush_streaming: Callable[[], None] | None = None,
         hooks: HookManager | None = None,
         skill_registry: Any = None,
         co_author: str = "",
@@ -101,6 +102,7 @@ class QueryEngine:
         self._on_tool_start = on_tool_start
         self._on_tool_end = on_tool_end
         self._on_thinking = on_thinking
+        self._flush_streaming = flush_streaming
 
     async def run_turn(self, user_input: str) -> str:
         """Process a single user turn through the full agentic loop.
@@ -165,15 +167,16 @@ class QueryEngine:
             # Get text from response
             final_text = response.get_text()
 
-            log.debug(
-                "turn=%d model=%s stop=%s in=%d out=%d tool_calls=%d text_len=%d",
-                turn, self.model, response.stop_reason,
-                response.input_tokens, response.output_tokens,
-                len(response.get_tool_calls()), len(final_text),
-            )
-
             # Check for tool calls
             tool_calls = response.get_tool_calls()
+            content_types = [type(c).__name__ for c in response.content]
+
+            log.debug(
+                "turn=%d model=%s stop=%s in=%d out=%d tool_calls=%d text_len=%d content=%s",
+                turn, self.model, response.stop_reason,
+                response.input_tokens, response.output_tokens,
+                len(tool_calls), len(final_text), content_types,
+            )
 
             if not tool_calls:
                 # If truncated (finish_reason=length), warn the user
@@ -194,6 +197,10 @@ class QueryEngine:
                     )
                     continue
                 break  # end_turn — no more tools to run
+
+            # Flush streaming text before showing tool call UI
+            if hasattr(self, '_flush_streaming') and self._flush_streaming:
+                self._flush_streaming()
 
             # Notify UI about tool calls
             for tc in tool_calls:
