@@ -119,8 +119,6 @@ class ToolRegistry:
 
 def create_default_registry(cwd: str) -> ToolRegistry:
     """Create a registry with all built-in tools."""
-    import sys
-
     from ccos.tools.agent import AgentTool
     from ccos.tools.ask_user import AskUserQuestionTool
     from ccos.tools.bash import BashTool
@@ -169,10 +167,5 @@ def create_default_registry(cwd: str) -> ToolRegistry:
 
     # Tool search (deferred tool loading)
     registry.register(ToolSearchTool())
-
-    # Windows-only: PowerShell
-    if sys.platform == "win32":
-        from ccos.tools.powershell import PowerShellTool
-        registry.register(PowerShellTool())
 
     return registry
