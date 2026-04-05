@@ -52,6 +52,9 @@ def _part_to_gemini(block: Any, tool_names: dict[str, str] | None = None) -> dic
         }
         if block.id:
             part["functionCall"]["id"] = block.id
+        sig = block.metadata.get("thoughtSignature")
+        if sig:
+            part["thoughtSignature"] = sig
         return part
     if isinstance(block, ToolResultContent):
         response: dict[str, Any] = {"result": _tool_result_to_response(block)}
@@ -145,13 +148,38 @@ def _messages_to_gemini(messages: list[Message]) -> list[dict[str, Any]]:
     return out
 
 
+_GEMINI_SCHEMA_KEYS = frozenset({
+    "type", "format", "title", "description", "nullable", "enum",
+    "maxItems", "minItems", "properties", "required", "minProperties",
+    "maxProperties", "minLength", "maxLength", "pattern", "example",
+    "anyOf", "propertyOrdering", "default", "items", "minimum", "maximum",
+})
+
+
+def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Strip fields not supported by the Gemini API Schema object."""
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key not in _GEMINI_SCHEMA_KEYS:
+            continue
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {k: _clean_schema(v) for k, v in value.items() if isinstance(v, dict)}
+        elif key == "items" and isinstance(value, dict):
+            out[key] = _clean_schema(value)
+        elif key == "anyOf" and isinstance(value, list):
+            out[key] = [_clean_schema(v) for v in value if isinstance(v, dict)]
+        else:
+            out[key] = value
+    return out
+
+
 def _tools_to_gemini(tools: list[ToolSchema]) -> list[dict[str, Any]]:
     return [{
         "functionDeclarations": [
             {
                 "name": t.name,
                 "description": t.description,
-                "parameters": t.input_schema,
+                "parameters": _clean_schema(t.input_schema),
             }
             for t in tools
         ]
@@ -262,7 +290,12 @@ class GeminiProvider(LLMProvider):
 
         try:
             async with self._client.stream("POST", url, json=payload) as resp:
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    error_text = resp.text or f"HTTP {resp.status_code}"
+                    yield StreamChunk(type=ChunkType.ERROR, text=error_text)
+                    yield StreamChunk(type=ChunkType.DONE, stop_reason="error")
+                    return
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line or not line.startswith("data:"):
@@ -294,10 +327,15 @@ class GeminiProvider(LLMProvider):
                                     continue
                                 emitted_tool_ids.add(tool_id)
                                 saw_tool_call = True
+                                meta: dict[str, Any] = {}
+                                sig = part.get("thoughtSignature")
+                                if sig:
+                                    meta["thoughtSignature"] = sig
                                 tool_call = ToolCallContent(
                                     id=fc.get("id", ""),
                                     name=fc.get("name", ""),
                                     input=fc.get("args") or {},
+                                    metadata=meta,
                                 )
                                 yield StreamChunk(type=ChunkType.TOOL_CALL_START, tool_call=tool_call)
                                 yield StreamChunk(type=ChunkType.TOOL_CALL_END, tool_call=tool_call)
@@ -305,11 +343,6 @@ class GeminiProvider(LLMProvider):
                     usage = chunk.get("usageMetadata")
                     if usage:
                         last_usage = usage
-        except httpx.HTTPStatusError as e:
-            message = e.response.text
-            yield StreamChunk(type=ChunkType.ERROR, text=message)
-            yield StreamChunk(type=ChunkType.DONE, stop_reason="error")
-            return
         except Exception as e:
             yield StreamChunk(type=ChunkType.ERROR, text=str(e))
             yield StreamChunk(type=ChunkType.DONE, stop_reason="error")

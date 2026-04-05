@@ -344,7 +344,10 @@ class QueryEngine:
                     response.cache_creation_tokens = chunk.cache_creation_tokens
 
                 elif chunk.type == ChunkType.ERROR:
-                    current_text += f"\n\n[Error: {chunk.text}]"
+                    error_text = f"\n\n[API Error: {chunk.text}]"
+                    current_text += error_text
+                    if self._on_text:
+                        self._on_text(error_text)
         finally:
             # Ensure the async generator is properly closed to avoid
             # "Task was destroyed but it is pending!" warnings.
