@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from rich.console import Console
-from rich.panel import Panel
+from rich.padding import Padding
 from rich.text import Text
 
 from ccos.tools.base import Tool
@@ -38,12 +38,10 @@ def ask_permission(tool: Tool, params: dict[str, Any]) -> str:
             if isinstance(v, str) and len(v) < 200:
                 desc_parts.append(f"{k}: [cyan]{v}[/cyan]")
 
-    panel_content = "\n".join(desc_parts)
-    console.print(Panel(
-        panel_content,
-        title="[yellow]Permission Required[/yellow]",
-        border_style="yellow",
-    ))
+    console.print(f"\n[yellow]⚠️  Permission Required: [bold]{tool.name}[/bold][/yellow]")
+    if len(desc_parts) > 1:
+        console.print(Padding("\n".join(desc_parts[1:]), (0, 0, 0, 3)))
+    console.print()
 
     console.print(
         "  [green]Y[/green]es  |  "
