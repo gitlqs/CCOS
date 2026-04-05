@@ -19,6 +19,7 @@ Heading.LEVEL_ALIGN = {
     "h5": "left",
     "h6": "left",
 }
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.style import Style
 from rich.syntax import Syntax
@@ -137,20 +138,19 @@ class Renderer:
         """Show a tool invocation — CC style."""
         icon = _TOOL_ICONS.get(tc.name, "")
         params = tc.input
+        
+        self.console.print()
 
         # Bash: show command in syntax-highlighted panel
         if tc.name == "Bash" and "command" in params:
             cmd = params["command"]
             desc = params.get("description", "")
-            header = f"[tool.name]{icon}{tc.name}[/tool.name]"
+            header = f"[tool.name]╭─ {icon}{tc.name}[/tool.name]"
             if desc:
                 header += f"  [dim]{desc}[/dim]"
-            self.console.print(Panel(
-                Syntax(cmd, "bash", theme="monokai", word_wrap=True),
-                title=header,
-                border_style="dim cyan",
-                padding=(0, 1),
-            ))
+            
+            self.console.print(header)
+            self.console.print(Padding(Syntax(cmd, "bash", theme="monokai", word_wrap=True), (0, 0, 0, 3)))
             return
 
         # File-oriented tools: show path prominently
@@ -164,16 +164,10 @@ class Renderer:
                     v = v[:77] + "..."
                 detail_parts.append(f"{k}={v}")
             detail = "  ".join(detail_parts)
-            header = f"[tool.name]{icon}{tc.name}[/tool.name] [bold]{path}[/bold]"
+            header = f"[tool.name]╭─ {icon}{tc.name}[/tool.name] [bold]{path}[/bold]"
+            self.console.print(header)
             if detail:
-                self.console.print(Panel(
-                    f"[tool.param]{detail}[/tool.param]",
-                    title=header,
-                    border_style="dim cyan",
-                    padding=(0, 1),
-                ))
-            else:
-                self.console.print(f"  {header}")
+                self.console.print(Padding(f"[tool.param]{escape(detail)}[/tool.param]", (0, 0, 0, 3)))
             return
 
         # Generic tool display
@@ -183,54 +177,39 @@ class Renderer:
                 v_display = v[:117] + "..."
             else:
                 v_display = str(v)
-            params_str += f"  {k}: {v_display}\n"
+            params_str += f"{k}: {v_display}\n"
 
-        self.console.print(Panel(
-            f"[tool.name]{icon}{tc.name}[/tool.name]\n[tool.param]{params_str.rstrip()}[/tool.param]",
-            title="[dim]Tool Call[/dim]",
-            border_style="dim cyan",
-            padding=(0, 1),
-        ))
+        self.console.print(f"[tool.name]╭─ {icon}{tc.name}[/tool.name]")
+        if params_str:
+            self.console.print(Padding(f"[tool.param]{escape(params_str.rstrip())}[/tool.param]", (0, 0, 0, 3)))
 
     def print_tool_result(self, tool_name: str, content: str, is_error: bool = False) -> None:
         """Show a tool result."""
-        style = "red" if is_error else "green"
+        style = "red" if is_error else "dim"
         icon = _TOOL_ICONS.get(tool_name, "")
-        title = f"[dim]{icon}{tool_name} {'Error' if is_error else 'Result'}[/dim]"
-
+        
         # Truncate long results for display
-        max_display = 3000
-        if len(content) > max_display:
-            display = content[:max_display] + f"\n\n... ({len(content):,} total characters)"
+        lines = content.splitlines()
+        max_lines = 15 if not is_error else 50
+        if len(lines) > max_lines:
+            display = "\n".join(lines[:max_lines]) + f"\n\n... ({len(lines) - max_lines} more lines, {len(content):,} total chars)"
         else:
             display = content
+            
+        if not display.strip():
+            display = "(no output)"
 
         # File content (cat -n format)
         if tool_name == "Read" and not is_error and _looks_like_file_content(display):
-            self.console.print(Panel(
-                Syntax(display, "text", theme="monokai", line_numbers=False),
-                title=title,
-                border_style=f"dim {style}",
-                padding=(0, 1),
-            ))
+            self.console.print(Padding(Syntax(display, "text", theme="monokai", line_numbers=False), (0, 0, 0, 3)))
             return
 
         # Diff output from Edit
         if tool_name == "Edit" and not is_error:
-            self.console.print(Panel(
-                _format_edit_result(display),
-                title=title,
-                border_style=f"dim {style}",
-                padding=(0, 1),
-            ))
+            self.console.print(Padding(_format_edit_result(display), (0, 0, 0, 3)))
             return
 
-        self.console.print(Panel(
-            display,
-            title=title,
-            border_style=f"dim {style}",
-            padding=(0, 1),
-        ))
+        self.console.print(Padding(f"[{style}]{escape(display)}[/{style}]", (0, 0, 0, 3)))
 
     def print_thinking(self, text: str) -> None:
         """Show thinking content."""
@@ -238,7 +217,7 @@ class Renderer:
         self.console.print(f"[thinking]{text}[/thinking]", end="")
 
     def print_error(self, message: str) -> None:
-        self.console.print(f"[bold red]Error:[/bold red] {message}")
+        self.console.print(f"[bold red]Error:[/bold red] {escape(message)}")
 
     def print_status(self, message: str) -> None:
         self.console.print(f"[status]{message}[/status]")
@@ -249,13 +228,12 @@ class Renderer:
     def print_permission_request(self, tool_name: str, params: dict[str, Any]) -> None:
         """Show a permission request panel."""
         icon = _TOOL_ICONS.get(tool_name, "")
-        params_str = "\n".join(f"  {k}: {v}" for k, v in params.items())
-        self.console.print(Panel(
-            f"[tool.name]{icon}{tool_name}[/tool.name]\n[tool.param]{params_str}[/tool.param]",
-            title="[yellow]Permission Required[/yellow]",
-            border_style="yellow",
-            padding=(0, 1),
-        ))
+        params_str = "\n".join(f"{k}: {v}" for k, v in params.items())
+        
+        self.console.print(f"\n[yellow]⚠️  Permission Required: [bold]{icon}{tool_name}[/bold][/yellow]")
+        if params_str:
+            self.console.print(Padding(f"[tool.param]{escape(params_str)}[/tool.param]", (0, 0, 0, 3)))
+        self.console.print()
 
     def print_footer_hint(self, mode: str = "default") -> None:
         """Print the footer shortcut hints like CC does."""
