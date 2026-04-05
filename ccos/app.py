@@ -323,6 +323,7 @@ class App:
                     try:
                         result = self._run_async(self._async_turn(user_input))
                         self.renderer.flush_streaming()
+                        self.console.print()  # Add an empty line before next prompt
                         # Persist assistant response
                         self._persist_last_assistant()
                         # Background memory extraction
@@ -330,6 +331,7 @@ class App:
                     except KeyboardInterrupt:
                         self.renderer.flush_streaming()
                         self.renderer.print_status("Interrupted.")
+                        self.console.print()  # Add an empty line before next prompt
                         continue
 
                 except KeyboardInterrupt:

@@ -38,13 +38,13 @@ def ask_permission(tool: Tool, params: dict[str, Any]) -> str:
             if isinstance(v, str) and len(v) < 200:
                 desc_parts.append(f"{k}: [cyan]{v}[/cyan]")
 
-    console.print(f"\n[yellow]⚠️  Permission Required: [bold]{tool.name}[/bold][/yellow]")
+    console.print(Padding(f"\n[yellow]⚠️  Permission Required: [bold]{tool.name}[/bold][/yellow]", (0, 0, 0, 3)))
     if len(desc_parts) > 1:
-        console.print(Padding("\n".join(desc_parts[1:]), (0, 0, 0, 3)))
+        console.print(Padding("\n".join(desc_parts[1:]), (0, 0, 0, 6)))
     console.print()
 
     console.print(
-        "  [green]Y[/green]es  |  "
+        "   [green]Y[/green]es  |  "
         "[red]N[/red]o  |  "
         "[blue]A[/blue]lways allow  |  "
         "[magenta]D[/magenta]eny always"
@@ -52,7 +52,7 @@ def ask_permission(tool: Tool, params: dict[str, Any]) -> str:
 
     while True:
         try:
-            choice = console.input("[yellow]> [/yellow]").strip().lower()
+            choice = console.input("   [yellow]> [/yellow]").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return "no"
 
@@ -65,4 +65,4 @@ def ask_permission(tool: Tool, params: dict[str, Any]) -> str:
         if choice in ("d", "deny"):
             return "deny_always"
 
-        console.print("[dim]Please enter Y, N, A, or D[/dim]")
+        console.print("   [dim]Please enter Y, N, A, or D[/dim]")

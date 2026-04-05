@@ -116,7 +116,21 @@ class Renderer:
         if self._thinking_active:
             self._thinking_active = False
             self.console.print()
-        self.console.print(text, end="", highlight=False)
+            
+        # Add basic indentation for streamed chunks like errors
+        formatted = text
+        if not self._streaming_text and formatted:
+            # If it's the first chunk, start with indent after any leading newlines
+            leading_newlines = len(formatted) - len(formatted.lstrip("\n"))
+            formatted = "\n" * leading_newlines + "   " + formatted.lstrip("\n")
+            
+        # Replace remaining newlines with newline + indent (except the very last one if it ends the string)
+        if formatted.endswith("\n"):
+            formatted = formatted[:-1].replace("\n", "\n   ") + "\n"
+        else:
+            formatted = formatted.replace("\n", "\n   ")
+            
+        self.console.print(formatted, end="", highlight=False)
         self._streaming_text += text
 
     def flush_streaming(self) -> None:
@@ -132,7 +146,7 @@ class Renderer:
         """Render complete markdown text."""
         self.flush_streaming()
         if text.strip():
-            self.console.print(Markdown(text))
+            self.console.print(Padding(Markdown(text), (0, 0, 0, 3)))
 
     def print_tool_call(self, tc: ToolCallContent) -> None:
         """Show a tool invocation — CC style."""
@@ -149,8 +163,8 @@ class Renderer:
             if desc:
                 header += f"  [dim]{desc}[/dim]"
             
-            self.console.print(header)
-            self.console.print(Padding(Syntax(cmd, "bash", theme="monokai", word_wrap=True), (0, 0, 0, 3)))
+            self.console.print(Padding(header, (0, 0, 0, 3)))
+            self.console.print(Padding(Syntax(cmd, "bash", theme="monokai", word_wrap=True), (0, 0, 0, 6)))
             return
 
         # File-oriented tools: show path prominently
@@ -165,9 +179,9 @@ class Renderer:
                 detail_parts.append(f"{k}={v}")
             detail = "  ".join(detail_parts)
             header = f"[tool.name]╭─ {icon}{tc.name}[/tool.name] [bold]{path}[/bold]"
-            self.console.print(header)
+            self.console.print(Padding(header, (0, 0, 0, 3)))
             if detail:
-                self.console.print(Padding(f"[tool.param]{escape(detail)}[/tool.param]", (0, 0, 0, 3)))
+                self.console.print(Padding(f"[tool.param]{escape(detail)}[/tool.param]", (0, 0, 0, 6)))
             return
 
         # Generic tool display
@@ -179,9 +193,9 @@ class Renderer:
                 v_display = str(v)
             params_str += f"{k}: {v_display}\n"
 
-        self.console.print(f"[tool.name]╭─ {icon}{tc.name}[/tool.name]")
+        self.console.print(Padding(f"[tool.name]╭─ {icon}{tc.name}[/tool.name]", (0, 0, 0, 3)))
         if params_str:
-            self.console.print(Padding(f"[tool.param]{escape(params_str.rstrip())}[/tool.param]", (0, 0, 0, 3)))
+            self.console.print(Padding(f"[tool.param]{escape(params_str.rstrip())}[/tool.param]", (0, 0, 0, 6)))
 
     def print_tool_result(self, tool_name: str, content: str, is_error: bool = False) -> None:
         """Show a tool result."""
@@ -217,22 +231,22 @@ class Renderer:
         self.console.print(f"[thinking]{text}[/thinking]", end="")
 
     def print_error(self, message: str) -> None:
-        self.console.print(f"[bold red]Error:[/bold red] {escape(message)}")
+        self.console.print(Padding(f"[bold red]Error:[/bold red] {escape(message)}", (0, 0, 0, 3)))
 
     def print_status(self, message: str) -> None:
-        self.console.print(f"[status]{message}[/status]")
+        self.console.print(Padding(f"[status]{message}[/status]", (0, 0, 0, 3)))
 
     def print_cost(self, summary: str) -> None:
-        self.console.print(f"[cost]{summary}[/cost]")
+        self.console.print(Padding(f"[cost]{summary}[/cost]", (0, 0, 0, 3)))
 
     def print_permission_request(self, tool_name: str, params: dict[str, Any]) -> None:
         """Show a permission request panel."""
         icon = _TOOL_ICONS.get(tool_name, "")
         params_str = "\n".join(f"{k}: {v}" for k, v in params.items())
         
-        self.console.print(f"\n[yellow]⚠️  Permission Required: [bold]{icon}{tool_name}[/bold][/yellow]")
+        self.console.print(Padding(f"\n[yellow]⚠️  Permission Required: [bold]{icon}{tool_name}[/bold][/yellow]", (0, 0, 0, 3)))
         if params_str:
-            self.console.print(Padding(f"[tool.param]{escape(params_str)}[/tool.param]", (0, 0, 0, 3)))
+            self.console.print(Padding(f"[tool.param]{escape(params_str)}[/tool.param]", (0, 0, 0, 6)))
         self.console.print()
 
     def print_footer_hint(self, mode: str = "default") -> None:
