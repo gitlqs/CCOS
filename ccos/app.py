@@ -174,6 +174,7 @@ class App:
             hooks=self.hooks,
             skill_registry=self.skill_registry,
             co_author=self.config.git.co_author,
+            on_text_complete=self.renderer.print_markdown,
         )
 
         # Wire memory extractor's engine factory

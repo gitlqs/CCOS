@@ -83,6 +83,7 @@ class QueryEngine:
         hooks: HookManager | None = None,
         skill_registry: Any = None,
         co_author: str = "",
+        on_text_complete: Callable[[str], None] | None = None,
     ):
         self.provider = provider
         self.model = model
@@ -103,6 +104,7 @@ class QueryEngine:
         self._on_tool_end = on_tool_end
         self._on_thinking = on_thinking
         self._flush_streaming = flush_streaming
+        self._on_text_complete = on_text_complete
 
     async def run_turn(self, user_input: str) -> str:
         """Process a single user turn through the full agentic loop.
@@ -166,6 +168,10 @@ class QueryEngine:
 
             # Get text from response
             final_text = response.get_text()
+
+            # Print complete markdown text for this turn
+            if final_text.strip() and self._on_text_complete:
+                self._on_text_complete(final_text)
 
             # Check for tool calls
             tool_calls = response.get_tool_calls()
@@ -322,8 +328,6 @@ class QueryEngine:
                 if chunk.type == ChunkType.TEXT:
                     if chunk.text:
                         current_text += chunk.text
-                        if self._on_text:
-                            self._on_text(chunk.text)
 
                 elif chunk.type == ChunkType.THINKING:
                     if chunk.text and self._on_thinking:

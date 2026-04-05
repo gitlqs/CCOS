@@ -8,7 +8,17 @@ from typing import Any
 
 from rich.console import Console
 from rich.markup import escape
-from rich.markdown import Markdown
+from rich.markdown import Markdown, Heading
+
+# Override rich.markdown Heading to be left-aligned
+Heading.LEVEL_ALIGN = {
+    "h1": "left",
+    "h2": "left",
+    "h3": "left",
+    "h4": "left",
+    "h5": "left",
+    "h6": "left",
+}
 from rich.panel import Panel
 from rich.style import Style
 from rich.syntax import Syntax
@@ -119,6 +129,7 @@ class Renderer:
 
     def print_markdown(self, text: str) -> None:
         """Render complete markdown text."""
+        self.flush_streaming()
         if text.strip():
             self.console.print(Markdown(text))
 
