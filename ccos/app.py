@@ -73,6 +73,12 @@ class App:
         # Tools
         self.tool_registry = create_default_registry(self.cwd)
 
+        # Wire ToolSearch → tool_registry so activated tools become callable
+        from ccos.tools.tool_search import ToolSearchTool
+        _ts = self.tool_registry.get("ToolSearch")
+        if isinstance(_ts, ToolSearchTool):
+            _ts._tool_registry = self.tool_registry
+
         # Context
         self.ctx = ToolContext(cwd=self.cwd)
 
@@ -385,6 +391,7 @@ class App:
         try:
             from ccos.mcp.client import MCPManager
             from ccos.mcp.tools import register_mcp_tools
+            from ccos.mcp.types import ConnectionState
 
             self.mcp_manager = MCPManager()
 
@@ -402,6 +409,11 @@ class App:
                 if error:
                     self.console.print(f"  [dim]MCP [red]{name}[/red]: {error}[/dim]")
                 elif conn:
+                    if conn.state == ConnectionState.DISABLED:
+                        self.console.print(
+                            f"  [dim]MCP [yellow]{name}[/yellow]: disabled[/dim]"
+                        )
+                        continue
                     parts = []
                     if conn.tools:
                         parts.append(f"{len(conn.tools)} tools")
@@ -409,13 +421,17 @@ class App:
                         parts.append(f"{len(conn.resources)} resources")
                     if conn.prompts:
                         parts.append(f"{len(conn.prompts)} prompts")
-                    summary = ", ".join(parts) if parts else "connected"
+                    summary = ", ".join(parts) if parts else "connected (0 tools)"
                     self.console.print(
                         f"  [dim]MCP [green]{name}[/green] ({conn.config.type.value}): {summary}[/dim]"
                     )
 
-            # Register all MCP tools
-            register_mcp_tools(self.mcp_manager, self.tool_registry)
+            # Register all MCP tools as deferred (via ToolSearch)
+            registered = register_mcp_tools(self.mcp_manager, self.tool_registry)
+            if registered:
+                self.console.print(
+                    f"  [dim]MCP registered {len(registered)} deferred tools[/dim]"
+                )
         except Exception as e:
             self.console.print(f"  [dim]MCP init error: {e}[/dim]")
 

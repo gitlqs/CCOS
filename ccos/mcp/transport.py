@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
 from abc import ABC, abstractmethod
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 # JSON-RPC message type
 JSONRPCMessage = dict[str, Any]
@@ -92,16 +95,18 @@ class StdioTransport(MCPTransport):
             raise ConnectionError(
                 f"MCP server command not found: {self._command}"
             )
-        # Start background reader
+        # Start background readers
         self._notification_task = asyncio.create_task(self._read_loop())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
 
     async def close(self) -> None:
-        if self._notification_task:
-            self._notification_task.cancel()
-            try:
-                await self._notification_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._notification_task, getattr(self, '_stderr_task', None)):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         # Cancel pending requests
         for fut in self._pending_responses.values():
             if not fut.done():
@@ -148,29 +153,110 @@ class StdioTransport(MCPTransport):
         if not self._process or not self._process.stdin:
             return
         try:
-            data = json.dumps(message) + "\n"
+            body = json.dumps(message)
+            # Send as newline-delimited JSON (universally compatible).
+            # Servers using Content-Length framing on input are rare for
+            # Python MCP SDK; most read line-by-line. CL servers that
+            # also accept NL input will work fine.
+            data = body + "\n"
             self._process.stdin.write(data.encode("utf-8"))
             self._process.stdin.flush()
-        except OSError:
-            pass
+            logger.debug("MCP stdio sent: %s", body[:200])
+        except OSError as e:
+            logger.debug("MCP stdio send error: %s", e)
 
     async def _read_loop(self) -> None:
-        """Background task: read lines from stdout and dispatch."""
+        """Background task: read messages from stdout and dispatch.
+
+        Supports two framing formats:
+        1. Content-Length framing (used by Node.js MCP SDK):
+               Content-Length: <n>\r\n
+               \r\n
+               <n bytes of JSON>
+        2. Newline-delimited JSON (one JSON object per line).
+        """
         loop = asyncio.get_event_loop()
+        stdout = self._process.stdout if self._process else None
+        if not stdout:
+            return
+
+        def _readline() -> bytes:
+            return stdout.readline()  # type: ignore[union-attr]
+
+        def _read_exact(n: int) -> bytes:
+            return stdout.read(n)  # type: ignore[union-attr]
+
         while True:
             try:
-                if not self._process or not self._process.stdout:
+                if not self._process or self._process.poll() is not None:
                     break
-                line = await loop.run_in_executor(
-                    None, self._process.stdout.readline
-                )
+
+                line = await loop.run_in_executor(None, _readline)
                 if not line:
                     break
-                msg = json.loads(line.decode("utf-8"))
-                self._dispatch_message(msg)
-            except (json.JSONDecodeError, OSError):
-                continue
+
+                decoded = line.decode("utf-8").strip()
+                if not decoded:
+                    continue
+
+                # Content-Length framing
+                if decoded.lower().startswith("content-length:"):
+                    try:
+                        length = int(decoded.split(":", 1)[1].strip())
+                    except (ValueError, IndexError):
+                        logger.debug("MCP stdio: bad Content-Length header: %s", decoded)
+                        continue
+
+                    # Read until blank line (end of headers)
+                    while True:
+                        header_line = await loop.run_in_executor(None, _readline)
+                        if not header_line or header_line.strip() == b"":
+                            break
+
+                    # Read exact body
+                    body = await loop.run_in_executor(None, _read_exact, length)
+                    if not body:
+                        break
+                    try:
+                        msg = json.loads(body.decode("utf-8"))
+                        logger.debug("MCP stdio recv (CL): %s", str(msg)[:200])
+                        self._dispatch_message(msg)
+                    except json.JSONDecodeError as e:
+                        logger.debug("MCP stdio: JSON decode error in CL body: %s", e)
+                        continue
+                else:
+                    # Newline-delimited JSON
+                    try:
+                        msg = json.loads(decoded)
+                        logger.debug("MCP stdio recv (NL): %s", str(msg)[:200])
+                        self._dispatch_message(msg)
+                    except json.JSONDecodeError:
+                        # Could be server log output — skip
+                        logger.debug("MCP stdio: non-JSON line: %s", decoded[:100])
+                        continue
+
             except asyncio.CancelledError:
+                break
+            except OSError:
+                break
+
+    async def _read_stderr(self) -> None:
+        """Background task: log server stderr for diagnostics."""
+        loop = asyncio.get_event_loop()
+        stderr = self._process.stderr if self._process else None
+        if not stderr:
+            return
+        while True:
+            try:
+                line = await loop.run_in_executor(None, stderr.readline)
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    logger.debug("MCP stdio stderr: %s", text)
+            except asyncio.CancelledError:
+                break
+            except Exception:
                 break
 
     def _dispatch_message(self, msg: JSONRPCMessage) -> None:

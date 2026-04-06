@@ -113,6 +113,12 @@ class MCPConnection:
                 )
 
             self._server_info = init_result.get("serverInfo", {})
+            logger.debug(
+                "MCP %s: initialized — serverInfo=%s capabilities=%s",
+                self.name,
+                init_result.get("serverInfo"),
+                init_result.get("capabilities"),
+            )
 
             # Send initialized notification
             await self._send_notification("notifications/initialized", {})
@@ -246,9 +252,14 @@ class MCPConnection:
     async def _fetch_tools(self) -> None:
         try:
             result = await self._send_request("tools/list", {})
-        except RuntimeError:
+        except RuntimeError as e:
+            logger.debug("MCP %s: tools/list RuntimeError: %s", self.name, e)
             return
+        logger.debug("MCP %s: tools/list raw result type=%s", self.name,
+                      type(result).__name__)
         if result and isinstance(result, dict):
+            raw_tools = result.get("tools", [])
+            logger.debug("MCP %s: found %d tools in response", self.name, len(raw_tools))
             self._tools = [
                 MCPToolDef(
                     name=t.get("name", ""),
@@ -256,8 +267,10 @@ class MCPConnection:
                     input_schema=t.get("inputSchema", {}),
                     server_name=self.name,
                 )
-                for t in result.get("tools", [])
+                for t in raw_tools
             ]
+        else:
+            logger.debug("MCP %s: tools/list returned %r", self.name, result)
 
     async def _fetch_resources(self) -> None:
         try:
@@ -298,13 +311,18 @@ class MCPConnection:
         self, method: str, params: dict[str, Any]
     ) -> dict[str, Any] | None:
         if not self._transport:
+            logger.debug("MCP %s: no transport for %s", self.name, method)
             return None
         self._request_id += 1
         try:
-            return await self._transport.send_request(method, params, self._request_id)
+            result = await self._transport.send_request(method, params, self._request_id)
+            logger.debug("MCP %s %s → %s", self.name, method,
+                         str(result)[:200] if result else "None")
+            return result
         except RuntimeError:
             raise
-        except Exception:
+        except Exception as e:
+            logger.debug("MCP %s %s error: %s", self.name, method, e)
             return None
 
     async def _send_notification(

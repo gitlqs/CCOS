@@ -62,14 +62,32 @@ def register_mcp_tools(
     mcp_manager: MCPManager,
     tool_registry: Any,  # ToolRegistry
 ) -> list[str]:
-    """Register all connected MCP tools into the CCOS tool registry.
+    """Register MCP tools as *deferred* tools via ToolSearch.
 
-    Returns list of registered tool names.
+    MCP tools are NOT added to the main tool registry directly.
+    Instead they are registered with the ToolSearchTool so the LLM
+    can discover and load them on demand. This avoids bloating the
+    tool schema list sent with every API call.
+
+    Returns list of registered (deferred) tool names.
     """
+    from ccos.tools.tool_search import ToolSearchTool
+
+    # Find the ToolSearchTool instance in the registry
+    tool_search = tool_registry.get("ToolSearch")
+    if not isinstance(tool_search, ToolSearchTool):
+        # Fallback: register directly if ToolSearch not available
+        registered = []
+        for mcp_tool in mcp_manager.all_tools:
+            wrapper = MCPToolWrapper(mcp_tool, mcp_manager)
+            tool_registry.register(wrapper)
+            registered.append(wrapper.name)
+        return registered
+
     registered = []
     for mcp_tool in mcp_manager.all_tools:
         wrapper = MCPToolWrapper(mcp_tool, mcp_manager)
-        tool_registry.register(wrapper)
+        tool_search.register_deferred(wrapper)
         registered.append(wrapper.name)
     return registered
 

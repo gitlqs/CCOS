@@ -15,10 +15,17 @@ from ccos.tools.base import Tool, ToolContext, ToolOutput
 class ToolSearchTool(Tool):
     name = "ToolSearch"
     description = (
-        "Fetches full schema definitions for deferred tools so they can be called. "
-        "Deferred tools appear by name in system messages. Until fetched, only the "
-        "name is known. Use this tool with a query to search for tools by name or "
-        "keyword. Result format: matched tools' complete definitions."
+        "Fetches full schema definitions for deferred tools so they can be called.\n\n"
+        "Deferred tools appear by name in <available-deferred-tools> messages. Until fetched, "
+        "only the name is known — there is no parameter schema, so the tool cannot be invoked. "
+        "This tool takes a query, matches it against the deferred tool list, and returns the "
+        "matched tools' complete JSONSchema definitions inside a <functions> block. Once a "
+        "tool's schema appears in that result, it is callable exactly like any tool defined "
+        "at the top of the prompt.\n\n"
+        "Query forms:\n"
+        '- "select:Read,Edit,Grep" — fetch these exact tools by name\n'
+        '- "notebook jupyter" — keyword search, up to max_results best matches\n'
+        '- "+slack send" — require "slack" in the name, rank by remaining terms'
     )
     input_schema = {
         "type": "object",
@@ -42,6 +49,7 @@ class ToolSearchTool(Tool):
 
     def __init__(self) -> None:
         self._deferred_tools: dict[str, Tool] = {}
+        self._tool_registry: Any = None  # Set by App to enable activation
 
     def register_deferred(self, tool: Tool) -> None:
         """Register a tool as deferred — schema available via ToolSearch only."""
@@ -50,6 +58,11 @@ class ToolSearchTool(Tool):
     @property
     def deferred_names(self) -> list[str]:
         return list(self._deferred_tools.keys())
+
+    def _activate_tool(self, tool: Tool) -> None:
+        """Move a deferred tool into the main registry so it can be called."""
+        if self._tool_registry is not None:
+            self._tool_registry.register(tool)
 
     async def execute(self, params: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         query = params.get("query", "")
@@ -94,16 +107,21 @@ class ToolSearchTool(Tool):
                 content=f"No tools matched query '{query}'. Available deferred tools: {available}",
             )
 
-        # Format as tool definitions
+        # Activate matched tools so they become callable
         matched = matched[:max_results]
-        lines = []
         for tool in matched:
-            import json
-            schema_str = json.dumps(tool.input_schema, indent=2)
-            lines.append(
-                f"## {tool.name}\n"
-                f"Description: {tool.description}\n"
-                f"Schema:\n```json\n{schema_str}\n```"
-            )
+            self._activate_tool(tool)
 
-        return ToolOutput(content="\n\n".join(lines))
+        # Format as <functions> block matching the provider's tool format
+        import json
+        func_lines = []
+        for tool in matched:
+            func_def = {
+                "description": tool.description,
+                "name": tool.name,
+                "parameters": tool.input_schema,
+            }
+            func_lines.append(f'<function>{json.dumps(func_def)}</function>')
+
+        result = "<functions>\n" + "\n".join(func_lines) + "\n</functions>"
+        return ToolOutput(content=result)

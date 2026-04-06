@@ -129,6 +129,13 @@ class QueryEngine:
                     model_skills = self.skill_registry.get_model_invocable()
                 except Exception:
                     pass
+            # Collect deferred tool names from ToolSearch
+            deferred_names: list[str] = []
+            from ccos.tools.tool_search import ToolSearchTool
+            _ts = self.tools.get("ToolSearch")
+            if isinstance(_ts, ToolSearchTool):
+                deferred_names = _ts.deferred_names
+
             system = self.prompt_builder.build(
                 tools=self.tools.get_all(),
                 model=self.model,
@@ -136,6 +143,7 @@ class QueryEngine:
                 provider_name=self.provider.name,
                 co_author=self.co_author,
                 skills=model_skills,
+                deferred_tool_names=deferred_names,
             )
 
             # Get tool schemas

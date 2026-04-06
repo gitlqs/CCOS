@@ -46,6 +46,7 @@ class PromptBuilder:
         plan_content: str = "",
         skills: list[SkillDefinition] | None = None,
         co_author: str = "",
+        deferred_tool_names: list[str] | None = None,
     ) -> str:
         sections: list[str] = []
 
@@ -60,6 +61,14 @@ class PromptBuilder:
         sections.append(get_git_commit_section(co_author=co_author))
         sections.append(get_pr_section())
         sections.append(get_bash_instructions())
+
+        # ── Deferred tools (MCP etc.) ───────────────────────────
+        if deferred_tool_names:
+            lines = ["<available-deferred-tools>"]
+            for name in sorted(deferred_tool_names):
+                lines.append(name)
+            lines.append("</available-deferred-tools>")
+            sections.append("\n".join(lines))
 
         # ── Skills section ───────────────────────────────────────
         if skills:
