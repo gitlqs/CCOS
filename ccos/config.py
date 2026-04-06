@@ -57,6 +57,7 @@ class GitConfig:
 class UIConfig:
     theme: str = "auto"
     vim_mode: bool = False
+    tool_display: str = "full"  # "full" or "header"
 
 
 @dataclass
@@ -143,6 +144,7 @@ class Config:
         ui = UIConfig(
             theme=ui_raw.get("theme", "auto"),
             vim_mode=ui_raw.get("vim_mode", False),
+            tool_display=ui_raw.get("tool_display", "full"),
         )
 
         git_raw = d.get("git", {})
@@ -177,6 +179,7 @@ class Config:
             "ui": {
                 "theme": self.ui.theme,
                 "vim_mode": self.ui.vim_mode,
+                "tool_display": self.ui.tool_display,
             },
             "git": {
                 "co_author": self.git.co_author,

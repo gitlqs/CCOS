@@ -100,6 +100,7 @@ class App:
         # UI (must be before _init_mcp which uses self.console)
         self.console = Console()
         self.renderer = Renderer(self.console)
+        self.renderer.tool_display = self.config.ui.tool_display
         self.status_bar = StatusBar(self.console)
         self._prompt_mode: PromptMode = "default"
 
