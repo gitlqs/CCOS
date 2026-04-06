@@ -787,6 +787,27 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         state = "enabled" if app.config.ui.vim_mode else "disabled"
         console.print(f"[dim]Vim mode {state}. Takes effect on next input.[/dim]")
 
+    def cmd_tool_display(args: str = "", **_: Any) -> None:
+        """Toggle or set tool call display verbosity."""
+        console = Console()
+        arg = args.strip().lower()
+        if arg in ("full", "header"):
+            app.renderer.tool_display = arg
+        elif arg == "":
+            # Toggle between the two modes
+            current = app.renderer.tool_display
+            app.renderer.tool_display = "header" if current == "full" else "full"
+        else:
+            console.print("[red]Usage: /tool-display [full|header][/red]")
+            console.print("[dim]  full   — show tool params and results[/dim]")
+            console.print("[dim]  header — show tool name only (compact)[/dim]")
+            return
+        mode = app.renderer.tool_display
+        app.config.ui.tool_display = mode
+        app.config.save()
+        desc = "full (params + results)" if mode == "full" else "header only (compact)"
+        console.print(f"[dim]Tool display: {desc}[/dim]")
+
     def cmd_theme(args: str = "", **_: Any) -> None:
         console = Console()
         if args.strip():
@@ -1088,9 +1109,16 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         from ccos.mcp.types import MCPServerConfig, TransportType, ConnectionState
         from ccos.mcp.tools import register_mcp_tools, unregister_mcp_tools
 
-        # Ensure mcp_manager exists
+        # Ensure MCP is initialized (connects servers if first access)
         if not hasattr(app, "mcp_manager") or app.mcp_manager is None:
-            app.mcp_manager = MCPManager()
+            if hasattr(app, "_ensure_mcp") and hasattr(app, "_mcp_initialized") and not app._mcp_initialized:
+                try:
+                    app._run_async(app._ensure_mcp())
+                except Exception:
+                    pass
+            # Fallback if _ensure_mcp didn't create it
+            if not hasattr(app, "mcp_manager") or app.mcp_manager is None:
+                app.mcp_manager = MCPManager()
 
         parts = args.strip().split(maxsplit=1)
         subcmd = parts[0] if parts else ""
@@ -1175,7 +1203,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             # Connect immediately
             console.print(f"[dim]Connecting to '{name}'...[/dim]")
             config = MCPServerConfig.from_dict(cfg_dict)
-            error = asyncio.run(app.mcp_manager.connect_server(name, config))
+            error = app._run_async(app.mcp_manager.connect_server(name, config))
             if error:
                 console.print(f"[red]Connection failed: {error}[/red]")
             else:
@@ -1198,7 +1226,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                 return
             name = sub_args
             # Disconnect
-            disconnected = asyncio.run(app.mcp_manager.disconnect_server(name))
+            disconnected = app._run_async(app.mcp_manager.disconnect_server(name))
             # Remove from config
             if name in app.config.mcp_servers:
                 del app.config.mcp_servers[name]
@@ -1222,7 +1250,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             console.print(f"[dim]Reconnecting to '{name}'...[/dim]")
             # Unregister old tools first
             unregister_mcp_tools(name, app.tool_registry)
-            error = asyncio.run(app.mcp_manager.reconnect_server(name))
+            error = app._run_async(app.mcp_manager.reconnect_server(name))
             if error:
                 console.print(f"[red]Reconnection failed: {error}[/red]")
             else:
@@ -1247,7 +1275,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                 conn = app.mcp_manager.get_connection(name)
                 if not conn or not conn.is_connected:
                     config = MCPServerConfig.from_dict(app.config.mcp_servers[name])
-                    error = asyncio.run(app.mcp_manager.connect_server(name, config))
+                    error = app._run_async(app.mcp_manager.connect_server(name, config))
                     if error:
                         console.print(f"[red]Enable failed: {error}[/red]")
                     else:
@@ -1266,7 +1294,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             if name in app.config.mcp_servers:
                 app.config.mcp_servers[name]["enabled"] = False
                 app.config.save()
-                asyncio.run(app.mcp_manager.disconnect_server(name))
+                app._run_async(app.mcp_manager.disconnect_server(name))
                 unregister_mcp_tools(name, app.tool_registry)
                 console.print(f"[yellow]Server '{name}' disabled.[/yellow]")
             else:
@@ -1363,7 +1391,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
 
             console.print(f"[dim]Calling {tool.name}({json.dumps(test_args, ensure_ascii=False)})...[/dim]")
             try:
-                result = asyncio.run(conn.call_tool(tool.name, test_args))
+                result = app._run_async(conn.call_tool(tool.name, test_args))
                 console.print(Panel(
                     result[:3000],
                     title=f"Result: {tool.name}",
@@ -1760,6 +1788,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
     registry.register(SlashCommand("mcp", "Manage MCP servers (add/remove/reconnect/test)", cmd_mcp))
     registry.register(SlashCommand("skills", "Manage skills (list/create/delete/show/edit/reload)", cmd_skills))
     registry.register(SlashCommand("co-author", "Configure Co-Authored-By for git commits", cmd_co_author))
+    registry.register(SlashCommand("tool-display", "Toggle tool call display (full/header)", cmd_tool_display, aliases=["td"]))
 
     # Register skill-based slash commands (if skill system is initialized)
     if hasattr(app, "skill_registry") and app.skill_registry is not None:
