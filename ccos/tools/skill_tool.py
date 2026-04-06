@@ -70,7 +70,7 @@ class SkillTool(Tool):
         if self._skill_registry is None:
             return PermissionCheck(PermissionDecision.DENY, "Skill system not initialized")
 
-        skill_name = params.get("skill", "")
+        skill_name = params.get("skill", "").lstrip("/")
         skill = self._skill_registry.get(skill_name)
 
         if skill is None:
@@ -94,7 +94,7 @@ class SkillTool(Tool):
         return PermissionCheck(PermissionDecision.ASK, f"Skill '{skill_name}' requests execution")
 
     async def execute(self, params: dict[str, Any], ctx: ToolContext) -> ToolOutput:
-        skill_name = params.get("skill", "")
+        skill_name = params.get("skill", "").lstrip("/")
         args = params.get("args", "")
 
         if self._skill_registry is None or self._skill_executor is None:
