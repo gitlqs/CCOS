@@ -45,8 +45,8 @@ class MessageManager:
         self.max_context_tokens = max_context_tokens
         self._compaction_summary: str | None = None  # Summary from compaction
 
-    def add_user(self, text: str) -> None:
-        self.messages.append(Message(role="user", content=text))
+    def add_user(self, content: str | list[Any]) -> None:
+        self.messages.append(Message(role="user", content=content))
 
     def add_assistant_response(self, response: LLMResponse) -> None:
         self.messages.append(Message(role="assistant", content=response.content))

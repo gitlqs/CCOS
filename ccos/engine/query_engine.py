@@ -106,12 +106,56 @@ class QueryEngine:
         self._flush_streaming = flush_streaming
         self._on_text_complete = on_text_complete
 
+    def _parse_user_input_for_images(self, text: str) -> list[Any] | str:
+        import base64
+        import mimetypes
+        import os
+        import re
+        from ccos.providers.base import ImageContent
+
+        # Match absolute paths that end with common image extensions
+        pattern = r'(?P<path>(?:[a-zA-Z]:[\\/]|/)[^\s\'"<>|]+\.(?:png|jpe?g|gif|webp|bmp))'
+        matches = list(re.finditer(pattern, text, re.IGNORECASE))
+        if not matches:
+            return text
+
+        blocks = []
+        last_idx = 0
+        for match in matches:
+            path = match.group("path")
+            if os.path.exists(path) and os.path.isfile(path):
+                if match.start() > last_idx:
+                    blocks.append(TextContent(text=text[last_idx:match.start()]))
+                try:
+                    with open(path, "rb") as f:
+                        data = base64.b64encode(f.read()).decode("utf-8")
+                    mime = mimetypes.guess_type(path)[0] or "image/png"
+                    # Include the path text for context
+                    blocks.append(TextContent(text=f"[Attached Image: {os.path.basename(path)}]"))
+                    blocks.append(ImageContent(
+                        source_type="base64",
+                        media_type=mime,
+                        data=data
+                    ))
+                except Exception:
+                    blocks.append(TextContent(text=text[match.start():match.end()]))
+                last_idx = match.end()
+            else:
+                blocks.append(TextContent(text=text[last_idx:match.end()]))
+                last_idx = match.end()
+
+        if last_idx < len(text):
+            blocks.append(TextContent(text=text[last_idx:]))
+
+        return blocks if len(blocks) > 0 else text
+
     async def run_turn(self, user_input: str) -> str:
         """Process a single user turn through the full agentic loop.
 
         Returns the final text response.
         """
-        self.messages.add_user(user_input)
+        parsed_input = self._parse_user_input_for_images(user_input)
+        self.messages.add_user(parsed_input)
         final_text = ""
         turn = 0
 

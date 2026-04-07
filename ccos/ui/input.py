@@ -66,6 +66,14 @@ def create_input_session(
     def _ctrl_j(event):
         event.current_buffer.insert_text("\n")
 
+    @bindings.add(Keys.Escape, 'v')
+    def _alt_v(event):
+        from ccos.ui.clipboard import get_clipboard_image
+        path = get_clipboard_image()
+        if path:
+            # Insert the path where the cursor is
+            event.current_buffer.insert_text(f" {path} ")
+
     # Persistent history
     history_dir = os.path.join(os.path.expanduser("~"), ".ccos")
     os.makedirs(history_dir, exist_ok=True)
