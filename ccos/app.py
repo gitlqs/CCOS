@@ -156,7 +156,16 @@ class App:
         perm_mode = PermissionMode.TRUST_ALL if trust_all else PermissionMode(
             self.config.permissions.mode
         )
-        self.permissions = PermissionManager(mode=perm_mode)
+        
+        # Convert config lists to sets for PermissionManager
+        always_allow = {k: set(v) for k, v in self.config.permissions.always_allow.items()}
+        always_deny = {k: set(v) for k, v in self.config.permissions.always_deny.items()}
+        
+        self.permissions = PermissionManager(
+            mode=perm_mode,
+            always_allow=always_allow,
+            always_deny=always_deny,
+        )
 
         # Hooks
         self.hooks = HookManager()
