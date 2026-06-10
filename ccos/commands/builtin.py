@@ -160,7 +160,21 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             console.print(f"[dim]Use /provider <name> to switch.[/dim]")
 
     def cmd_cost(**_: Any) -> None:
-        Console().print(app.engine.cost.summary())
+        console = Console()
+        # cc: Claude.ai subscribers see a usage message instead of a dollar amount.
+        try:
+            from ccos.auth import load_credentials
+            creds = load_credentials()
+            is_subscriber = bool(getattr(creds, "oauth_token", ""))
+        except Exception:
+            is_subscriber = False
+        if is_subscriber:
+            console.print(
+                "You are currently using your subscription to power your Claude "
+                "Code usage"
+            )
+            return
+        console.print(app.engine.cost.summary())
 
     def cmd_status(**_: Any) -> None:
         console = Console()
@@ -175,7 +189,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             console.print("[yellow]Plan mode: ACTIVE[/yellow]")
         console.print(app.engine.cost.summary())
 
-    def cmd_compact(**_: Any) -> None:
+    def cmd_compact(args: str = "", **_: Any) -> None:
         console = Console()
         mgr = app.engine.messages
         if len(mgr.messages) <= 6:
@@ -186,6 +200,14 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         # Generate summary using the LLM
         console.print("[dim]Compacting conversation...[/dim]")
         summary_prompt = mgr.get_compact_prompt()
+        # cc supports `/compact [instructions]` — fold any custom summarization
+        # instructions into the summary request (compact.ts reads args.trim()).
+        custom_instructions = args.strip()
+        if custom_instructions:
+            summary_prompt += (
+                "\n\nAdditional summarization instructions from the user:\n"
+                f"{custom_instructions}"
+            )
         try:
             summary = asyncio.run(app.engine.run_turn(summary_prompt))
             # Remove the summary turn itself (last 2 messages: user + assistant)
@@ -412,27 +434,9 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             store.save_entry(entry)
             console.print(f"[green]Memory '{entry.name}' updated.[/green]")
 
-        else:
-            # Default: list all memories + CLAUDE.md files
+        elif subcmd == "auto":
+            # CCOS extension: list the auto-memory store entries.
             entries = store.scan_all()
-
-            # Also show CLAUDE.md files
-            claude_files = []
-            for name in ("CLAUDE.md", "CCOS.md"):
-                project_path = os.path.join(app.cwd, name)
-                if os.path.exists(project_path):
-                    claude_files.append(project_path)
-            home_claude = os.path.expanduser("~/.claude/CLAUDE.md")
-            if os.path.exists(home_claude):
-                claude_files.append(home_claude)
-
-            if claude_files:
-                console.print("[bold]Static memory files:[/bold]")
-                for p in claude_files:
-                    size = os.path.getsize(p)
-                    console.print(f"  [cyan]{p}[/cyan] ({size:,} bytes)")
-                console.print()
-
             if entries:
                 table = Table(title="Auto-Memory", border_style="dim")
                 table.add_column("Name", style="cyan")
@@ -451,9 +455,82 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                 console.print(table)
             else:
                 console.print("[dim]No auto-memories yet.[/dim]")
-
             console.print(f"\n[dim]Memory dir: {store.memory_dir}[/dim]")
             console.print("[dim]Subcommands: /memory add|delete|show|edit <name>[/dim]")
+
+        else:
+            # Default: edit the Claude memory files (CLAUDE.md hierarchy).
+            # Mirrors cc's /memory ("Edit Claude memory files").
+            claude_files: list[str] = []
+            seen: set[str] = set()
+            for name in ("CLAUDE.md", "CLAUDE.local.md", "CCOS.md"):
+                project_path = os.path.join(app.cwd, name)
+                if os.path.exists(project_path) and project_path not in seen:
+                    claude_files.append(project_path)
+                    seen.add(project_path)
+            for candidate in (
+                os.path.expanduser("~/.claude/CLAUDE.md"),
+                os.path.expanduser("~/.ccos/CLAUDE.md"),
+            ):
+                if os.path.exists(candidate) and candidate not in seen:
+                    claude_files.append(candidate)
+                    seen.add(candidate)
+
+            console.print("[bold]Claude memory files[/bold]")
+            if claude_files:
+                for i, p in enumerate(claude_files, 1):
+                    size = os.path.getsize(p)
+                    console.print(f"  [dim]{i}.[/dim] [cyan]{p}[/cyan] ({size:,} bytes)")
+            else:
+                console.print("[dim]No CLAUDE.md memory files found.[/dim]")
+
+            # Offer to open/create one in $EDITOR.
+            project_claude = os.path.join(app.cwd, "CLAUDE.md")
+            try:
+                if claude_files:
+                    choice = console.input(
+                        "\n[yellow]Open which file in editor? (number, or Enter to skip): [/yellow]"
+                    ).strip()
+                else:
+                    choice = console.input(
+                        f"\n[yellow]No CLAUDE.md found. Create and edit {project_claude}? (y/N): [/yellow]"
+                    ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                return
+
+            target: str | None = None
+            if claude_files and choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(claude_files):
+                    target = claude_files[idx]
+                else:
+                    console.print("[red]Invalid selection.[/red]")
+            elif not claude_files and choice == "y":
+                target = project_claude
+                if not os.path.exists(target):
+                    with open(target, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(
+                            "# CLAUDE.md\n\nThis file provides guidance to Claude "
+                            "Code (claude.ai/code) when working with code in this "
+                            "repository.\n"
+                        )
+
+            if target:
+                editor = os.environ.get(
+                    "EDITOR", "notepad" if os.name == "nt" else "vi"
+                )
+                try:
+                    subprocess.run([editor, target], check=False)
+                    console.print(f"[dim]Edited {target}[/dim]")
+                except Exception as e:
+                    console.print(f"[red]Could not open editor: {e}[/red]")
+                    console.print(f"[dim]File: {target}[/dim]")
+
+            console.print(
+                "\n[dim]Auto-memory store: /memory auto | "
+                "add|delete|show|edit <name>[/dim]"
+            )
 
     def cmd_doctor(**_: Any) -> None:
         console = Console()
@@ -739,28 +816,64 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             else:
                 console.print("[red]Invalid choice.[/red]")
 
+    # Verbatim from cc/src/commands/init.ts (OLD_INIT_PROMPT)
+    OLD_INIT_PROMPT = (
+        "Please analyze this codebase and create a CLAUDE.md file, which will be "
+        "given to future instances of Claude Code to operate in this repository.\n"
+        "\n"
+        "What to add:\n"
+        "1. Commands that will be commonly used, such as how to build, lint, and run "
+        "tests. Include the necessary commands to develop in this codebase, such as "
+        "how to run a single test.\n"
+        "2. High-level code architecture and structure so that future instances can "
+        "be productive more quickly. Focus on the \"big picture\" architecture that "
+        "requires reading multiple files to understand.\n"
+        "\n"
+        "Usage notes:\n"
+        "- If there's already a CLAUDE.md, suggest improvements to it.\n"
+        "- When you make the initial CLAUDE.md, do not repeat yourself and do not "
+        "include obvious instructions like \"Provide helpful error messages to "
+        "users\", \"Write unit tests for all new utilities\", \"Never include "
+        "sensitive information (API keys, tokens) in code or commits\".\n"
+        "- Avoid listing every component or file structure that can be easily "
+        "discovered.\n"
+        "- Don't include generic development practices.\n"
+        "- If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot "
+        "rules (in .github/copilot-instructions.md), make sure to include the "
+        "important parts.\n"
+        "- If there is a README.md, make sure to include the important parts.\n"
+        "- Do not make up information such as \"Common Development Tasks\", \"Tips "
+        "for Development\", \"Support and Documentation\" unless this is expressly "
+        "included in other files that you read.\n"
+        "- Be sure to prefix the file with the following text:\n"
+        "\n"
+        "```\n"
+        "# CLAUDE.md\n"
+        "\n"
+        "This file provides guidance to Claude Code (claude.ai/code) when working "
+        "with code in this repository.\n"
+        "```"
+    )
+
     def cmd_init(**_: Any) -> None:
-        """Initialize a CLAUDE.md / CCOS.md in the project."""
+        """Initialize a new CLAUDE.md file with codebase documentation.
+
+        Mirrors cc's prompt-type /init command: inject the codebase-analysis
+        prompt as a user turn so the model analyzes the repo and authors
+        CLAUDE.md (rather than writing a static template).
+        """
         console = Console()
-        target = os.path.join(app.cwd, "CLAUDE.md")
-        if os.path.exists(target):
-            console.print(f"[dim]{target} already exists.[/dim]")
-            return
-        template = (
-            "# Project Instructions\n\n"
-            "<!-- Add project-specific instructions for the AI here. -->\n"
-            "<!-- This file is loaded into every conversation as context. -->\n\n"
-            "## Project Overview\n\n"
-            "<!-- Describe your project, tech stack, and conventions. -->\n\n"
-            "## Code Style\n\n"
-            "<!-- Describe preferred code style, patterns, and conventions. -->\n\n"
-            "## Testing\n\n"
-            "<!-- Describe how to run tests and testing conventions. -->\n"
-        )
-        with open(target, "w", encoding="utf-8", newline="\n") as f:
-            f.write(template)
-        console.print(f"[green]Created {target}[/green]")
-        console.print("[dim]Edit this file to provide project-specific instructions to the AI.[/dim]")
+        try:
+            app.session_manager.save_user_message("/init")
+            console.print("[dim]Analyzing your codebase...[/dim]")
+            app._run_async(app._async_skill_turn(OLD_INIT_PROMPT))
+            app.renderer.flush_streaming()
+            app._persist_last_assistant()
+        except KeyboardInterrupt:
+            app.renderer.flush_streaming()
+            app.renderer.print_status("Interrupted.")
+        except Exception as e:
+            console.print(f"[red]/init error: {e}[/red]")
 
     def cmd_permissions(**_: Any) -> None:
         console = Console()
@@ -873,11 +986,30 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             table.add_row(path, when)
         console.print(table)
 
-    def cmd_fast(**_: Any) -> None:
-        """Toggle fast mode (same model, faster output)."""
+    def cmd_fast(args: str = "", **_: Any) -> None:
+        """Toggle fast mode (accepts [on|off])."""
         console = Console()
-        # In our implementation, fast mode is a hint to the provider
-        console.print("[dim]Fast mode toggled. (Same model, optimized for speed.)[/dim]")
+        arg = args.strip().lower()
+        current = bool(getattr(app.config.ui, "fast_mode", False))
+        if arg in ("on", "true", "1", "yes"):
+            new_state = True
+        elif arg in ("off", "false", "0", "no"):
+            new_state = False
+        elif arg == "":
+            new_state = not current
+        else:
+            console.print("[red]Usage: /fast [on|off][/red]")
+            return
+        # CCOS does not currently switch to a distinct fast-mode model; this only
+        # records the preference rather than claiming a model swap.
+        if hasattr(app.config.ui, "fast_mode"):
+            app.config.ui.fast_mode = new_state
+            try:
+                app.config.save()
+            except Exception:
+                pass
+        state = "on" if new_state else "off"
+        console.print(f"[dim]Fast mode {state}.[/dim]")
 
     def cmd_branch(**_: Any) -> None:
         """Show current git branch."""
@@ -955,32 +1087,60 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             for m, (inp, out) in cost._model_tokens.items():
                 console.print(f"    {m}: {inp:,} in / {out:,} out")
 
-    def cmd_review(**_: Any) -> None:
-        """Review all changes made in this session."""
+    def cmd_review(args: str = "", **_: Any) -> None:
+        """Review a pull request.
+
+        Mirrors cc's prompt-type /review command: inject the PR code-review
+        prompt as a user turn so the model uses `gh` to review the PR.
+        """
         console = Console()
+        # Verbatim from cc/src/commands/review.ts (LOCAL_REVIEW_PROMPT)
+        local_review_prompt = (
+            "\n"
+            "      You are an expert code reviewer. Follow these steps:\n"
+            "\n"
+            "      1. If no PR number is provided in the args, run `gh pr list` to "
+            "show open PRs\n"
+            "      2. If a PR number is provided, run `gh pr view <number>` to get "
+            "PR details\n"
+            "      3. Run `gh pr diff <number>` to get the diff\n"
+            "      4. Analyze the changes and provide a thorough code review that "
+            "includes:\n"
+            "         - Overview of what the PR does\n"
+            "         - Analysis of code quality and style\n"
+            "         - Specific suggestions for improvements\n"
+            "         - Any potential issues or risks\n"
+            "\n"
+            "      Keep your review concise but thorough. Focus on:\n"
+            "      - Code correctness\n"
+            "      - Following project conventions\n"
+            "      - Performance implications\n"
+            "      - Test coverage\n"
+            "      - Security considerations\n"
+            "\n"
+            "      Format your review with clear sections and bullet points.\n"
+            "\n"
+            f"      PR number: {args}\n"
+            "    "
+        )
         try:
-            result = subprocess.run(
-                ["git", "diff", "HEAD"],
-                capture_output=True, text=True, cwd=app.cwd, timeout=15,
-            )
-            if result.stdout.strip():
-                from rich.syntax import Syntax
-                console.print(Panel(
-                    Syntax(result.stdout[:10000], "diff", theme="monokai"),
-                    title="[bold]Changes Since Last Commit[/bold]",
-                    border_style="yellow",
-                ))
-            else:
-                console.print("[dim]No uncommitted changes.[/dim]")
+            app.session_manager.save_user_message(f"/review {args}".strip())
+            console.print("[dim]Reviewing pull request...[/dim]")
+            app._run_async(app._async_skill_turn(local_review_prompt))
+            app.renderer.flush_streaming()
+            app._persist_last_assistant()
+        except KeyboardInterrupt:
+            app.renderer.flush_streaming()
+            app.renderer.print_status("Interrupted.")
         except Exception as e:
-            console.print(f"[red]Error: {e}[/red]")
+            console.print(f"[red]/review error: {e}[/red]")
 
     def cmd_pr_comments(args: str = "", **_: Any) -> None:
         """Show comments on a GitHub PR."""
         console = Console()
         pr_num = args.strip()
         if not pr_num:
-            console.print("[red]Usage: /pr_comments <PR number or URL>[/red]")
+            console.print("[red]Usage: /pr-comments <PR number or URL>[/red]")
             return
         try:
             # Try to get repo info from git
@@ -1026,7 +1186,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         console.print("[bold]Report a Bug[/bold]\n")
         console.print("To report an issue:")
         console.print("  1. Use /export to save the conversation")
-        console.print("  2. Submit at: https://github.com/your-org/ccos/issues")
+        console.print("  2. Submit at: https://github.com/anthropics/claude-code/issues")
         console.print()
         console.print(f"Session ID: [dim]{app.session_manager.session_id}[/dim]")
         if app.session_manager.transcript_path:
@@ -1557,6 +1717,97 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             console.print(f"[green]Co-author set to:[/green] [cyan]{arg}[/cyan]")
             console.print("[dim]All future commits will include: Co-Authored-By: " + arg + "[/dim]")
 
+    # ── Agent configuration management ───────────────────────────
+    def cmd_agents(args: str = "", **_: Any) -> None:
+        """Manage agent configurations.
+
+        Lists subagent definition files from the standard `.claude/agents/`
+        locations (project + user) and allows editing them in $EDITOR,
+        mirroring cc's /agents command and the /skills management UX.
+        """
+        console = Console()
+        from pathlib import Path as _Path
+
+        agent_dirs = [
+            _Path(app.cwd) / ".claude" / "agents",
+            _Path.home() / ".claude" / "agents",
+            _Path.home() / ".ccos" / "agents",
+        ]
+
+        # Collect agent definition files (markdown front-matter style).
+        agent_files: list[_Path] = []
+        seen: set[str] = set()
+        for d in agent_dirs:
+            if d.is_dir():
+                for f in sorted(d.glob("*.md")):
+                    key = str(f.resolve())
+                    if key not in seen:
+                        agent_files.append(f)
+                        seen.add(key)
+
+        def _read_agent_meta(path: _Path) -> tuple[str, str]:
+            """Return (name, description) from YAML front-matter, best-effort."""
+            name = path.stem
+            description = ""
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                return name, description
+            if text.startswith("---"):
+                end = text.find("---", 3)
+                front = text[3:end] if end != -1 else ""
+                for line in front.splitlines():
+                    line = line.strip()
+                    if line.lower().startswith("name:"):
+                        name = line.split(":", 1)[1].strip().strip("\"'") or name
+                    elif line.lower().startswith("description:"):
+                        description = line.split(":", 1)[1].strip().strip("\"'")
+            return name, description
+
+        if not agent_files:
+            console.print("[dim]No agent configurations found.[/dim]")
+            console.print()
+            console.print("[dim]Define subagents as markdown files with YAML "
+                          "front-matter in:[/dim]")
+            for d in agent_dirs:
+                console.print(f"  [cyan]{d}[/cyan]")
+            return
+
+        table = Table(title="Agent Configurations", border_style="dim")
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Name", style="cyan")
+        table.add_column("Description")
+        table.add_column("Source", style="dim")
+        for i, f in enumerate(agent_files, 1):
+            name, description = _read_agent_meta(f)
+            table.add_row(str(i), name, description[:60] or "(none)", str(f))
+        console.print(table)
+
+        try:
+            choice = console.input(
+                "\n[yellow]Edit which agent in editor? (number, or Enter to skip): "
+                "[/yellow]"
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return
+
+        if not choice.isdigit():
+            return
+        idx = int(choice) - 1
+        if not (0 <= idx < len(agent_files)):
+            console.print("[red]Invalid selection.[/red]")
+            return
+
+        target = str(agent_files[idx])
+        editor = os.environ.get("EDITOR", "notepad" if os.name == "nt" else "vi")
+        try:
+            subprocess.run([editor, target], check=False)
+            console.print(f"[dim]Edited {target}[/dim]")
+        except Exception as e:
+            console.print(f"[red]Could not open editor: {e}[/red]")
+            console.print(f"[dim]File: {target}[/dim]")
+
     # ── Skill management commands ────────────────────────────────
     def cmd_skills(args: str = "", **_: Any) -> None:
         """Manage skills: list, create, edit, delete, show, reload."""
@@ -1746,46 +1997,47 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             registry.register(cmd)
 
     # Register all
-    registry.register(SlashCommand("help", "Show available commands", cmd_help, aliases=["?"]))
-    registry.register(SlashCommand("exit", "Exit the application", cmd_exit, aliases=["quit", "q"]))
-    registry.register(SlashCommand("clear", "Clear conversation history", cmd_clear))
+    registry.register(SlashCommand("help", "Show help and available commands", cmd_help))
+    registry.register(SlashCommand("exit", "Exit the application", cmd_exit, aliases=["quit"]))
+    registry.register(SlashCommand("clear", "Clear conversation history and free up context", cmd_clear, aliases=["reset", "new"]))
     registry.register(SlashCommand("model", "Switch or show current model", cmd_model))
     registry.register(SlashCommand("provider", "Switch or show current provider", cmd_provider))
-    registry.register(SlashCommand("cost", "Show token usage and cost", cmd_cost))
-    registry.register(SlashCommand("status", "Show current session status", cmd_status))
-    registry.register(SlashCommand("compact", "Compress conversation context", cmd_compact))
-    registry.register(SlashCommand("config", "Show config file location", cmd_config))
+    registry.register(SlashCommand("cost", "Show the total cost and duration of the current session", cmd_cost))
+    registry.register(SlashCommand("status", "Show Claude Code status including version, model, account, API connectivity, and tool statuses", cmd_status))
+    registry.register(SlashCommand("compact", "Clear conversation history but keep a summary in context. Optional: /compact [instructions for summarization]", cmd_compact))
+    registry.register(SlashCommand("config", "Show config file location", cmd_config, aliases=["settings"]))
     registry.register(SlashCommand("history", "List recent sessions", cmd_history))
-    registry.register(SlashCommand("resume", "Resume a previous session", cmd_resume))
-    registry.register(SlashCommand("diff", "Show git diff for current directory", cmd_diff))
+    registry.register(SlashCommand("resume", "Resume a previous conversation", cmd_resume, aliases=["continue"]))
+    registry.register(SlashCommand("diff", "View uncommitted changes and per-turn diffs", cmd_diff))
     registry.register(SlashCommand("plan", "Show plan mode status and current plan", cmd_plan))
-    registry.register(SlashCommand("memory", "Manage auto-memory (add/delete/show/edit)", cmd_memory))
-    registry.register(SlashCommand("doctor", "Check system configuration and dependencies", cmd_doctor))
+    registry.register(SlashCommand("memory", "Edit Claude memory files", cmd_memory))
+    registry.register(SlashCommand("doctor", "Diagnose and verify your Claude Code installation and settings", cmd_doctor))
     registry.register(SlashCommand("login", "Sign in with your API key", cmd_login))
-    registry.register(SlashCommand("logout", "Remove stored credentials", cmd_logout))
-    registry.register(SlashCommand("init", "Create a CLAUDE.md in the project", cmd_init))
-    registry.register(SlashCommand("permissions", "Show permission settings", cmd_permissions))
-    registry.register(SlashCommand("vim", "Toggle vim mode", cmd_vim))
-    registry.register(SlashCommand("theme", "Set or show color theme", cmd_theme))
-    registry.register(SlashCommand("export", "Export conversation as markdown", cmd_export))
-    registry.register(SlashCommand("hooks", "Show installed hooks", cmd_hooks))
+    registry.register(SlashCommand("logout", "Sign out from your Anthropic account", cmd_logout))
+    registry.register(SlashCommand("init", "Initialize a new CLAUDE.md file with codebase documentation", cmd_init))
+    registry.register(SlashCommand("permissions", "Show permission settings", cmd_permissions, aliases=["allowed-tools"]))
+    registry.register(SlashCommand("vim", "Toggle between Vim and Normal editing modes", cmd_vim))
+    registry.register(SlashCommand("theme", "Change the theme", cmd_theme))
+    registry.register(SlashCommand("export", "Export the current conversation to a file or clipboard", cmd_export))
+    registry.register(SlashCommand("hooks", "View hook configurations for tool events", cmd_hooks))
     registry.register(SlashCommand("files", "Show files accessed in this session", cmd_files))
     registry.register(SlashCommand("fast", "Toggle fast mode", cmd_fast))
     registry.register(SlashCommand("branch", "Show current git branch", cmd_branch))
+    registry.register(SlashCommand("agents", "Manage agent configurations", cmd_agents))
     # New commands
     registry.register(SlashCommand("add-dir", "Add an additional working directory", cmd_add_dir))
     registry.register(SlashCommand("context", "Show context window usage", cmd_context))
     registry.register(SlashCommand("session", "Show current session info", cmd_session))
-    registry.register(SlashCommand("stats", "Show detailed usage statistics", cmd_stats))
-    registry.register(SlashCommand("review", "Review all uncommitted changes", cmd_review))
-    registry.register(SlashCommand("pr_comments", "Show comments on a GitHub PR", cmd_pr_comments))
-    registry.register(SlashCommand("rewind", "Remove last N exchanges from conversation", cmd_rewind))
+    registry.register(SlashCommand("stats", "Show your Claude Code usage statistics and activity", cmd_stats))
+    registry.register(SlashCommand("review", "Review a pull request", cmd_review))
+    registry.register(SlashCommand("pr-comments", "Get comments from a GitHub pull request", cmd_pr_comments, aliases=["pr_comments"]))
+    registry.register(SlashCommand("rewind", "Restore the code and/or conversation to a previous point", cmd_rewind))
     registry.register(SlashCommand("bug", "Report a bug or share session", cmd_bug, aliases=["issue"]))
-    registry.register(SlashCommand("terminal-setup", "Show terminal setup recommendations", cmd_terminal_setup))
+    registry.register(SlashCommand("terminal-setup", "Install Shift+Enter key binding for newlines", cmd_terminal_setup))
     registry.register(SlashCommand("mode", "Switch permission mode", cmd_mode))
-    registry.register(SlashCommand("copy", "Copy last response to clipboard", cmd_copy))
+    registry.register(SlashCommand("copy", "Copy Claude's last response to clipboard (or /copy N for the Nth-latest)", cmd_copy))
     registry.register(SlashCommand("color", "Preview color theme", cmd_color))
-    registry.register(SlashCommand("mcp", "Manage MCP servers (add/remove/reconnect/test)", cmd_mcp))
+    registry.register(SlashCommand("mcp", "Manage MCP servers", cmd_mcp))
     registry.register(SlashCommand("skills", "Manage skills (list/create/delete/show/edit/reload)", cmd_skills))
     registry.register(SlashCommand("co-author", "Configure Co-Authored-By for git commits", cmd_co_author))
     registry.register(SlashCommand("tool-display", "Toggle tool call display (full/header)", cmd_tool_display, aliases=["td"]))
