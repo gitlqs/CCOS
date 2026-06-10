@@ -15,9 +15,10 @@ class FileWriteTool(Tool):
         "Writes a file to the local filesystem.\n\n"
         "Usage:\n"
         "- This tool will overwrite the existing file if there is one at the provided path.\n"
-        "- If this is an existing file, you MUST use the Read tool first to read the file's contents.\n"
-        "- Prefer the Edit tool for modifying existing files — it only sends the diff.\n"
-        "- NEVER create documentation files (*.md) or README files unless explicitly requested."
+        "- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n"
+        "- Prefer the Edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n"
+        "- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n"
+        "- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
@@ -48,20 +49,14 @@ class FileWriteTool(Tool):
         # If file exists, it must have been read first
         if exists and not ctx.was_read(file_path):
             return ToolOutput(
-                content=(
-                    f"Error: You must read the file before overwriting it. "
-                    f"Use the Read tool first on: {file_path}"
-                ),
+                content="File has not been read yet. Read it first before writing to it.",
                 is_error=True,
             )
 
         # Check for external modifications since read
         if exists and ctx.was_modified_since_read(file_path):
             return ToolOutput(
-                content=(
-                    f"Error: File {file_path} has been modified since you last read it. "
-                    f"Read it again before writing."
-                ),
+                content="File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.",
                 is_error=True,
             )
 
