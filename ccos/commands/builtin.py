@@ -390,7 +390,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
             entry = store.load_entry(sub_args)
             if entry:
                 from rich.markdown import Markdown
-                header = f"[cyan]{entry.name}[/cyan] ({entry.type.value}) — {entry.description}"
+                header = f"[cyan]{entry.name}[/cyan] ({entry.type.value if entry.type else '?'}) — {entry.description}"
                 age_warn = store.get_age_warning(entry)
                 if age_warn:
                     header += f"\n[yellow]{age_warn}[/yellow]"
@@ -451,7 +451,7 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                         age = f"{int(days)}d"
                     else:
                         age = f"{int(days / 30)}mo"
-                    table.add_row(e.name, e.type.value, e.description[:50], age)
+                    table.add_row(e.name, e.type.value if e.type else "?", e.description[:50], age)
                 console.print(table)
             else:
                 console.print("[dim]No auto-memories yet.[/dim]")
@@ -694,6 +694,18 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
                 email=acct_data.get("email_address", ""),
                 display_name=org_data.get("name", ""),
                 organization_id=org_data.get("uuid", ""),
+            )
+            # Persist granted scopes + subscription type (cc stores both under
+            # the oauth credential block). Best-effort across response shapes.
+            scope_raw = token_data.get("scope", "")
+            if isinstance(scope_raw, str) and scope_raw:
+                creds.oauth_scopes = scope_raw.split()
+            else:
+                creds.oauth_scopes = list(token_data.get("scopes", []) or [])
+            creds.oauth_subscription_type = (
+                token_data.get("subscription_type")
+                or token_data.get("subscriptionType")
+                or (acct_data.get("subscription_type") if isinstance(acct_data, dict) else None)
             )
             save_credentials(creds)
 
@@ -1212,13 +1224,18 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
         console = Console()
         from ccos.permissions.manager import PermissionMode
         if args.strip():
-            try:
-                new_mode = PermissionMode(args.strip())
+            # PermissionMode._missing_ now coerces unknown input to DEFAULT
+            # instead of raising, so validate explicitly to keep the
+            # "Invalid mode" feedback. Accept canonical values + legacy aliases.
+            raw = args.strip()
+            valid = {m.value.lower() for m in PermissionMode} | {"trust_all", "trustall", "yolo"}
+            if raw.lower() in valid:
+                new_mode = PermissionMode(raw)
                 app.permissions.mode = new_mode
                 console.print(f"[green]Permission mode set to: {new_mode.value}[/green]")
-            except ValueError:
+            else:
                 modes = ", ".join(m.value for m in PermissionMode)
-                console.print(f"[red]Invalid mode. Available: {modes}[/red]")
+                console.print(f"[red]Invalid mode '{raw}'. Available: {modes}[/red]")
         else:
             console.print(f"Current mode: [cyan]{app.permissions.mode.value}[/cyan]")
             modes = ", ".join(m.value for m in PermissionMode)
@@ -1551,11 +1568,11 @@ def register_builtin_commands(registry: CommandRegistry, app: App) -> None:
 
             console.print(f"[dim]Calling {tool.name}({json.dumps(test_args, ensure_ascii=False)})...[/dim]")
             try:
-                result = app._run_async(conn.call_tool(tool.name, test_args))
+                result, is_error = app._run_async(conn.call_tool(tool.name, test_args))
                 console.print(Panel(
                     result[:3000],
                     title=f"Result: {tool.name}",
-                    border_style="green",
+                    border_style="red" if is_error else "green",
                 ))
             except Exception as e:
                 console.print(f"[red]Error: {e}[/red]")

@@ -48,6 +48,7 @@ class PromptBuilder:
         skills: list[SkillDefinition] | None = None,
         co_author: str = "",
         deferred_tool_names: list[str] | None = None,
+        mcp_instructions: str | None = None,
     ) -> str:
         sections: list[str] = []
 
@@ -76,6 +77,10 @@ class PromptBuilder:
                 lines.append(name)
             lines.append("</available-deferred-tools>")
             sections.append("\n".join(lines))
+
+        # ── MCP server instructions (from connected servers) ─────
+        if mcp_instructions:
+            sections.append(mcp_instructions)
 
         # ── Skills section ───────────────────────────────────────
         if skills:

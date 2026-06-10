@@ -83,7 +83,7 @@ class App:
         self.ctx = ToolContext(cwd=self.cwd)
 
         # Plan manager
-        self.plan_manager = PlanManager()
+        self.plan_manager = PlanManager(plans_directory=self.config.plans_directory)
 
         # Memory store + extractor
         from ccos.memory.store import MemoryStore
@@ -191,6 +191,7 @@ class App:
             skill_registry=self.skill_registry,
             co_author=self.config.git.co_author,
             on_text_complete=self.renderer.print_markdown,
+            mcp_instructions_provider=self._get_mcp_instructions,
         )
 
         # Wire memory extractor's engine factory
@@ -537,7 +538,14 @@ class App:
             on_tool_start=None,
             on_tool_end=None,
             on_thinking=None,
+            mcp_instructions_provider=self._get_mcp_instructions,
         )
+
+    def _get_mcp_instructions(self) -> str | None:
+        """Live `# MCP Server Instructions` section from connected servers."""
+        if self.mcp_manager is None:
+            return None
+        return self.mcp_manager.get_mcp_instructions_section()
 
     def _handle_slash_command(self, raw: str) -> None:
         """Parse and execute a slash command."""

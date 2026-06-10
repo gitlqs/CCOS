@@ -114,7 +114,7 @@ class SkillExecutor:
             # Create sub-engine with optional model override
             model_override = skill.model if skill.model and skill.model != "inherit" else ""
             sub_engine = self._engine_factory(model_override=model_override)
-            result = await sub_engine.run_turn(content)
+            result = await sub_engine.run_turn(content, max_turns=200)
             return result or f"(Skill '{skill.name}' returned no output)"
         except Exception as e:
             return f"Error executing skill '{skill.name}': {e}"

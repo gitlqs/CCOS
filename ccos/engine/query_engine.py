@@ -99,6 +99,7 @@ class QueryEngine:
         skill_registry: Any = None,
         co_author: str = "",
         on_text_complete: Callable[[str], None] | None = None,
+        mcp_instructions_provider: Callable[[], str | None] | None = None,
     ):
         self.provider = provider
         self.model = model
@@ -113,6 +114,9 @@ class QueryEngine:
         self.hooks = hooks
         self.skill_registry = skill_registry
         self.co_author = co_author
+        # Provider for the live "# MCP Server Instructions" prompt section
+        # (evaluated each turn so newly-connected servers are picked up).
+        self._mcp_instructions_provider = mcp_instructions_provider
         # Callbacks for UI
         self._on_text = on_text
         self._on_tool_start = on_tool_start
@@ -227,6 +231,13 @@ class QueryEngine:
             if isinstance(_ts, ToolSearchTool):
                 deferred_names = _ts.deferred_names
 
+            mcp_instructions = None
+            if self._mcp_instructions_provider is not None:
+                try:
+                    mcp_instructions = self._mcp_instructions_provider()
+                except Exception:
+                    mcp_instructions = None
+
             system = self.prompt_builder.build(
                 tools=self.tools.get_all(),
                 model=self.model,
@@ -235,6 +246,7 @@ class QueryEngine:
                 co_author=self.co_author,
                 skills=model_skills,
                 deferred_tool_names=deferred_names,
+                mcp_instructions=mcp_instructions,
             )
 
             # Get tool schemas

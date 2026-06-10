@@ -151,7 +151,7 @@ class AgentTool(Tool):
             sub_engine = self._engine_factory(model_override=model)
             if run_bg:
                 agent_id = f"agent_{uuid.uuid4().hex[:8]}"
-                task = asyncio.create_task(sub_engine.run_turn(prompt))
+                task = asyncio.create_task(sub_engine.run_turn(prompt, max_turns=200))
                 ctx.background_tasks[agent_id] = {
                     "type": "agent",
                     "description": description,
@@ -166,7 +166,7 @@ class AgentTool(Tool):
                     )
                 )
             else:
-                result = await sub_engine.run_turn(prompt)
+                result = await sub_engine.run_turn(prompt, max_turns=200)
                 return ToolOutput(content=result or "(Agent returned no output)")
         except Exception as e:
             return ToolOutput(content=f"Agent error: {e}", is_error=True)
