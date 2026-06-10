@@ -15,9 +15,74 @@ from ccos.providers.base import (
 
 # Approximate token-to-character ratio (conservative)
 _CHARS_PER_TOKEN = 4
-# Default context budget (leave room for system prompt + response)
-_DEFAULT_MAX_CONTEXT_TOKENS = 180_000
-_COMPACT_THRESHOLD = 0.75  # Compact when we hit 75% of budget
+
+# Context-window accounting, mirroring cc's autoCompact.ts.
+# cc uses a flat 200k context window for all current models
+# (MODEL_CONTEXT_WINDOW_DEFAULT) and reserves up to 20k tokens for the
+# compaction summary output (MAX_OUTPUT_TOKENS_FOR_SUMMARY).
+_MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
+_MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000
+
+# Buffers below the effective context window (cc/src/services/compact/autoCompact.ts).
+_AUTOCOMPACT_BUFFER_TOKENS = 13_000   # AUTOCOMPACT_BUFFER_TOKENS
+_MANUAL_COMPACT_BUFFER_TOKENS = 3_000  # MANUAL_COMPACT_BUFFER_TOKENS
+
+# Per-model context windows (input tokens). cc treats all current models as
+# 200k unless a 1M-context variant is in use; we key on a canonical short name.
+_MODEL_CONTEXT_WINDOWS: dict[str, int] = {}
+
+# Per-model max output tokens. cc's getMaxOutputTokensForModel returns 32k by
+# default (capped to 64k); only min(maxOutput, 20k) is reserved, so any value
+# >= 20k yields the same reservation.
+_DEFAULT_MAX_OUTPUT_TOKENS = 32_000
+
+# Back-compat: kept so callers passing an explicit budget still work, but the
+# auto-compact decision is now derived from the model's effective window.
+_DEFAULT_MAX_CONTEXT_TOKENS = _MODEL_CONTEXT_WINDOW_DEFAULT
+
+
+def _context_window_for_model(model: str | None) -> int:
+    """Return the context window (in tokens) for a model, defaulting to 200k.
+
+    Mirrors cc's getContextWindowForModel: a flat default with a 1M bump for
+    explicitly 1M-capable variants (Sonnet 4.x / Opus 4.6 marked ``[1m]``).
+    """
+    if not model:
+        return _MODEL_CONTEXT_WINDOW_DEFAULT
+    name = model.lower()
+    if "[1m]" in name:
+        return 1_000_000
+    return _MODEL_CONTEXT_WINDOWS.get(model, _MODEL_CONTEXT_WINDOW_DEFAULT)
+
+
+def _max_output_tokens_for_model(model: str | None) -> int:
+    """Return the max output token budget for a model (cc default 32k)."""
+    return _DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def effective_context_window(model: str | None) -> int:
+    """Context window minus the tokens reserved for a compaction summary.
+
+    cc: getEffectiveContextWindowSize = contextWindow - min(maxOutput, 20_000).
+    """
+    reserved = min(_max_output_tokens_for_model(model), _MAX_OUTPUT_TOKENS_FOR_SUMMARY)
+    return _context_window_for_model(model) - reserved
+
+
+def autocompact_threshold(model: str | None) -> int:
+    """Token threshold at which auto-compaction should trigger.
+
+    cc: getAutoCompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS.
+    """
+    return effective_context_window(model) - _AUTOCOMPACT_BUFFER_TOKENS
+
+
+def blocking_limit(model: str | None) -> int:
+    """Hard token limit above which a request must not be sent.
+
+    cc: effectiveContextWindow - MANUAL_COMPACT_BUFFER_TOKENS (3_000).
+    """
+    return effective_context_window(model) - _MANUAL_COMPACT_BUFFER_TOKENS
 
 
 def _estimate_message_tokens(msg: Message) -> int:
@@ -44,12 +109,23 @@ class MessageManager:
         self.messages: list[Message] = []
         self.max_context_tokens = max_context_tokens
         self._compaction_summary: str | None = None  # Summary from compaction
+        # Real token usage from the most recent LLMResponse, preferred over the
+        # chars//4 estimate when deciding whether to compact.
+        self._last_usage_tokens: int | None = None
 
     def add_user(self, content: str | list[Any]) -> None:
         self.messages.append(Message(role="user", content=content))
 
     def add_assistant_response(self, response: LLMResponse) -> None:
         self.messages.append(Message(role="assistant", content=response.content))
+        # Capture real context size from the provider when available. The
+        # input_tokens reflect everything the model just saw (system + history),
+        # which is a better signal than our char//4 estimate.
+        usage = (response.input_tokens or 0) + (response.cache_read_tokens or 0) + (
+            response.cache_creation_tokens or 0
+        )
+        if usage > 0:
+            self._last_usage_tokens = usage
 
     def add_tool_results(self, results: list[ToolResultContent]) -> None:
         """Add tool results as a user message (API convention)."""
@@ -64,6 +140,16 @@ class MessageManager:
     def clear(self) -> None:
         self.messages.clear()
         self._compaction_summary = None
+        self._last_usage_tokens = None
+
+    def current_token_estimate(self) -> int:
+        """Best available token count: real usage if known, else chars//4."""
+        estimate = self.estimate_total_tokens()
+        if self._last_usage_tokens is not None:
+            # Prefer the larger of the two so we never under-count after adding
+            # new messages since the last response.
+            return max(self._last_usage_tokens, estimate)
+        return estimate
 
     def get_turn_count(self) -> int:
         return sum(1 for m in self.messages if m.role == "user" and isinstance(m.content, str))
@@ -84,10 +170,23 @@ class MessageManager:
         """Estimate total tokens across all messages."""
         return sum(_estimate_message_tokens(m) for m in self.messages)
 
-    def needs_compaction(self) -> bool:
-        """Check if messages are approaching the context limit."""
-        threshold = int(self.max_context_tokens * _COMPACT_THRESHOLD)
-        return self.estimate_total_tokens() > threshold
+    def needs_compaction(self, model: str | None = None) -> bool:
+        """Check if messages have crossed the model-aware auto-compact threshold.
+
+        Mirrors cc's calculateTokenWarningState.isAboveAutoCompactThreshold:
+        trigger when the token count reaches
+        ``effective_context_window(model) - AUTOCOMPACT_BUFFER_TOKENS``.
+        """
+        return self.current_token_estimate() >= autocompact_threshold(model)
+
+    def is_at_blocking_limit(self, model: str | None = None) -> bool:
+        """Check whether the context is at cc's hard blocking limit.
+
+        Above ``effective_context_window(model) - MANUAL_COMPACT_BUFFER_TOKENS``
+        a request would overflow the context window. cc surfaces a clean
+        prompt-too-long error here rather than letting the provider 400.
+        """
+        return self.current_token_estimate() >= blocking_limit(model)
 
     def compact(self, summary: str) -> int:
         """Replace old messages with a compaction summary.

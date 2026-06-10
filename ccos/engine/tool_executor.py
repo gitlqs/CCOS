@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from ccos.hooks import HookManager
@@ -10,6 +11,83 @@ from ccos.permissions.manager import PermissionManager
 from ccos.permissions.prompts import ask_permission
 from ccos.providers.base import TextContent, ToolCallContent, ToolResultContent
 from ccos.tools.base import PermissionDecision, Tool, ToolContext, ToolOutput, ToolRegistry
+
+# ── Canonical tool_result messages (verbatim from cc/src/utils/messages.ts) ──
+# These exact strings steer the model's behavior after a denial, so they must
+# match cc word-for-word.
+CANCEL_MESSAGE = (
+    "The user doesn't want to take this action right now. STOP what you are "
+    "doing and wait for the user to tell you how to proceed."
+)
+REJECT_MESSAGE = (
+    "The user doesn't want to proceed with this tool use. The tool use was "
+    "rejected (eg. if it was a file edit, the new_string was NOT written to the "
+    "file). STOP what you are doing and wait for the user to tell you how to "
+    "proceed."
+)
+REJECT_MESSAGE_WITH_REASON_PREFIX = (
+    "The user doesn't want to proceed with this tool use. The tool use was "
+    "rejected (eg. if it was a file edit, the new_string was NOT written to the "
+    "file). To tell you how to proceed, the user said:\n"
+)
+SUBAGENT_REJECT_MESSAGE = (
+    "Permission for this tool use was denied. The tool use was rejected (eg. if "
+    "it was a file edit, the new_string was NOT written to the file). Try a "
+    "different approach or report the limitation to complete your task."
+)
+DENIAL_WORKAROUND_GUIDANCE = (
+    "IMPORTANT: You *may* attempt to accomplish this action using other tools "
+    "that might naturally be used to accomplish this goal, e.g. using head "
+    "instead of cat. But you *should not* attempt to work around this denial in "
+    "malicious ways, e.g. do not use your ability to run tests to execute "
+    "non-test actions. You should only try to work around this restriction in "
+    "reasonable ways that do not attempt to bypass the intent behind this "
+    "denial. If you believe this capability is essential to complete the user's "
+    "request, STOP and explain to the user what you were trying to do and why "
+    "you need this permission. Let the user decide how to proceed."
+)
+
+
+def AUTO_REJECT_MESSAGE(tool_name: str) -> str:
+    """Policy/rule denial message (cc: AUTO_REJECT_MESSAGE)."""
+    return f"Permission to use {tool_name} has been denied. {DENIAL_WORKAROUND_GUIDANCE}"
+
+
+# Max number of read-only tools to run concurrently (cc default
+# CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY = 10).
+def _max_tool_use_concurrency() -> int:
+    raw = os.environ.get("CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY", "")
+    try:
+        parsed = int(raw)
+        if parsed > 0:
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    return 10
+
+
+def _is_concurrency_safe(tool: Tool, params: dict[str, Any]) -> bool:
+    """Determine whether a tool call may run concurrently with its neighbours.
+
+    Mirrors cc's partitionToolCalls guard: validate the input first, then call
+    the tool's concurrency-safe predicate, defaulting to NOT-safe on any
+    validation failure or exception. ``is_concurrency_safe`` is a distinct
+    concept from read-only; tools may opt out of parallelism even when
+    read-only. Falls back to ``is_read_only`` when a tool defines no explicit
+    ``is_concurrency_safe`` method.
+    """
+    # Conservative input validation: a missing required key or a non-dict input
+    # means we cannot trust the predicate, so treat as not-safe (serial).
+    if not isinstance(params, dict):
+        return False
+    try:
+        predicate = getattr(tool, "is_concurrency_safe", None)
+        if callable(predicate):
+            return bool(predicate(params))
+        return bool(tool.is_read_only(params))
+    except Exception:
+        # If the predicate raises (e.g. malformed input), be conservative.
+        return False
 
 
 async def execute_tool_calls(
@@ -19,43 +97,51 @@ async def execute_tool_calls(
     permissions: PermissionManager,
     hooks: HookManager | None = None,
 ) -> list[ToolResultContent]:
-    """Execute a batch of tool calls, respecting concurrency and permissions.
+    """Execute a batch of tool calls, preserving the model's emitted order.
 
-    Read-only tools run in parallel; write tools run sequentially.
+    Mirrors cc's toolOrchestration.runTools: partition the calls into
+    consecutive batches that are EITHER a single non-concurrency-safe tool OR a
+    run of consecutive concurrency-safe tools. Each batch runs (concurrent
+    inside the batch, capped at the max concurrency), but the batches run in
+    sequence, so a write between two reads forces three batches rather than a
+    global reorder. Results are returned 1:1 with ``tool_calls``.
     """
-    results: list[ToolResultContent] = []
-
-    # Separate into read-only (parallelizable) and write (serial)
-    read_only: list[ToolCallContent] = []
-    write_ops: list[ToolCallContent] = []
-
+    # Resolve each call's tool once and detect unknown tools up front.
+    resolved: list[tuple[ToolCallContent, Tool | None]] = []
     for tc in tool_calls:
-        tool = registry.get(tc.name)
-        if tool is None:
-            results.append(ToolResultContent(
-                tool_use_id=tc.id,
-                content=f"Error: Unknown tool '{tc.name}'",
-                is_error=True,
-            ))
-            continue
-        if tool.is_read_only(tc.input):
-            read_only.append(tc)
+        resolved.append((tc, registry.get(tc.name)))
+
+    # Build batches of (is_concurrency_safe, [tool_calls]) preserving order.
+    batches: list[tuple[bool, list[ToolCallContent]]] = []
+    for tc, tool in resolved:
+        # Unknown tools, and any non-concurrency-safe tool, get their own serial
+        # batch (matching cc's conservative fallback on validation failure).
+        safe = tool is not None and _is_concurrency_safe(tool, tc.input)
+        if safe and batches and batches[-1][0]:
+            batches[-1][1].append(tc)
         else:
-            write_ops.append(tc)
+            batches.append((safe, [tc]))
 
-    # Execute read-only tools in parallel
-    if read_only:
-        tasks = [
-            _execute_single(tc, registry, ctx, permissions, hooks)
-            for tc in read_only
-        ]
-        parallel_results = await asyncio.gather(*tasks)
-        results.extend(parallel_results)
+    results: list[ToolResultContent] = []
+    max_concurrency = _max_tool_use_concurrency()
 
-    # Execute write tools sequentially
-    for tc in write_ops:
-        result = await _execute_single(tc, registry, ctx, permissions, hooks)
-        results.append(result)
+    for is_safe, batch in batches:
+        if is_safe and len(batch) > 1:
+            # Run the concurrency-safe run together, capped at max_concurrency.
+            sem = asyncio.Semaphore(max_concurrency)
+
+            async def _run(tc: ToolCallContent) -> ToolResultContent:
+                async with sem:
+                    return await _execute_single(tc, registry, ctx, permissions, hooks)
+
+            batch_results = await asyncio.gather(*[_run(tc) for tc in batch])
+            results.extend(batch_results)
+        else:
+            # Single tool (concurrency-safe-singleton or non-safe) runs alone.
+            for tc in batch:
+                results.append(
+                    await _execute_single(tc, registry, ctx, permissions, hooks)
+                )
 
     return results
 
@@ -99,9 +185,11 @@ async def _execute_single(
     perm = permissions.check(tool, tc.input, ctx)
 
     if perm.decision == PermissionDecision.DENY:
+        # Policy/rule denial — use cc's AUTO_REJECT_MESSAGE wording so the model
+        # gets the canonical workaround guidance rather than a paraphrase.
         return ToolResultContent(
             tool_use_id=tc.id,
-            content=f"Permission denied: {perm.reason}",
+            content=AUTO_REJECT_MESSAGE(tool.name),
             is_error=True,
         )
 
@@ -110,7 +198,7 @@ async def _execute_single(
         if choice == "no":
             return ToolResultContent(
                 tool_use_id=tc.id,
-                content="The user denied this tool execution.",
+                content=REJECT_MESSAGE,
                 is_error=True,
             )
         elif choice == "always":
@@ -121,7 +209,7 @@ async def _execute_single(
             permissions.add_always_deny(tool.name, "*")
             return ToolResultContent(
                 tool_use_id=tc.id,
-                content="The user denied this tool execution.",
+                content=REJECT_MESSAGE,
                 is_error=True,
             )
 
