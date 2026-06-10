@@ -13,6 +13,7 @@ from ccos.prompt.sections import (
     get_intro_section,
     get_output_efficiency_section,
     get_pr_section,
+    get_session_guidance_section,
     get_system_section,
     get_tone_section,
     get_tools_section,
@@ -47,8 +48,15 @@ class PromptBuilder:
         skills: list[SkillDefinition] | None = None,
         co_author: str = "",
         deferred_tool_names: list[str] | None = None,
+        mcp_instructions: str | None = None,
     ) -> str:
         sections: list[str] = []
+
+        # ── Identity prefix (mirrors CC's always-present CLISyspromptPrefix) ──
+        # CCOS-branded rebrand — the "Claude Code"/"Anthropic" string is
+        # intentionally NOT copied; only the presence/position of an identity
+        # line matches CC.
+        sections.append("You are CCOS, an interactive CLI coding agent.")
 
         # ── Static sections (cacheable across sessions) ──────────
         sections.append(get_intro_section())
@@ -70,12 +78,19 @@ class PromptBuilder:
             lines.append("</available-deferred-tools>")
             sections.append("\n".join(lines))
 
+        # ── MCP server instructions (from connected servers) ─────
+        if mcp_instructions:
+            sections.append(mcp_instructions)
+
         # ── Skills section ───────────────────────────────────────
         if skills:
             sections.append(self._build_skills_section(skills))
 
         # ── Dynamic boundary ─────────────────────────────────────
         sections.append(DYNAMIC_BOUNDARY)
+
+        # ── Session-specific guidance (post-boundary, tool-gated) ─
+        sections.append(get_session_guidance_section(tools))
 
         # ── Plan mode context ────────────────────────────────────
         if plan_mode:

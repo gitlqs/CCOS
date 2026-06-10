@@ -134,9 +134,19 @@ def normalize_list_field(value: Any) -> list[str]:
 
 
 def normalize_bool_field(value: Any, default: bool = True) -> bool:
-    """Normalize a frontmatter field to boolean."""
+    """Normalize a frontmatter field to boolean (lenient legacy parser)."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.lower() in ("true", "yes", "1", "on")
     return default
+
+
+def parse_bool_field(value: Any) -> bool:
+    """Strictly parse a boolean frontmatter value.
+
+    Mirrors cc's parseBooleanFrontmatter: ONLY a literal boolean ``True`` or the
+    string ``"true"`` count as true; everything else (including "yes", "1",
+    "on", numbers, None) is false.
+    """
+    return value is True or (isinstance(value, str) and value.strip() == "true")

@@ -9,6 +9,7 @@ from typing import Any
 
 class SkillSource(str, Enum):
     """Where a skill was loaded from."""
+    MANAGED = "managed"        # Policy/managed .ccos/skills/ (highest precedence)
     PROJECT = "project"        # .ccos/skills/
     USER = "user"              # ~/.ccos/skills/
     LEGACY_PROJECT = "legacy"  # .ccos/commands/
