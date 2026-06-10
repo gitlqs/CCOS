@@ -10,16 +10,45 @@ from ccos.tools.base import Tool, ToolContext, ToolOutput
 _MAX_CONTENT_LENGTH = 50_000
 
 
+_DESCRIPTION = (
+    "\n"
+    "- Fetches content from a specified URL and processes it using an AI model\n"
+    "- Takes a URL and a prompt as input\n"
+    "- Fetches the URL content, converts HTML to markdown\n"
+    "- Processes the content with the prompt using a small, fast model\n"
+    "- Returns the model's response about the content\n"
+    "- Use this tool when you need to retrieve and analyze web content\n"
+    "\n"
+    "Usage notes:\n"
+    "  - IMPORTANT: If an MCP-provided web fetch tool is available, prefer using "
+    "that tool instead of this one, as it may have fewer restrictions.\n"
+    "  - The URL must be a fully-formed valid URL\n"
+    "  - HTTP URLs will be automatically upgraded to HTTPS\n"
+    "  - The prompt should describe what information you want to extract from the page\n"
+    "  - This tool is read-only and does not modify any files\n"
+    "  - Results may be summarized if the content is very large\n"
+    "  - Includes a self-cleaning 15-minute cache for faster responses when "
+    "repeatedly accessing the same URL\n"
+    "  - When a URL redirects to a different host, the tool will inform you and "
+    "provide the redirect URL in a special format. You should then make a new "
+    "WebFetch request with the redirect URL to fetch the content.\n"
+    "  - For GitHub URLs, prefer using the gh CLI via Bash instead "
+    "(e.g., gh pr view, gh issue view, gh api).\n"
+)
+
+_WARNING = (
+    "IMPORTANT: WebFetch WILL FAIL for authenticated or private URLs. Before using "
+    "this tool, check if the URL points to an authenticated service (e.g. Google "
+    "Docs, Confluence, Jira, GitHub). If so, look for a specialized MCP tool that "
+    "provides authenticated access."
+)
+
+
 class WebFetchTool(Tool):
     name = "WebFetch"
-    description = (
-        "Fetches content from a URL and returns it as text.\n\n"
-        "Use this tool to:\n"
-        "- Read documentation pages\n"
-        "- Fetch API responses\n"
-        "- Download and read web content\n\n"
-        "The tool extracts readable text from HTML pages automatically."
-    )
+    # cc assembles prompt as `warning + '\n' + DESCRIPTION`, and DESCRIPTION
+    # itself begins with a leading newline.
+    description = _WARNING + "\n" + _DESCRIPTION
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -29,10 +58,10 @@ class WebFetchTool(Tool):
             },
             "prompt": {
                 "type": "string",
-                "description": "Optional prompt to apply to the fetched content (e.g., 'summarize this page')",
+                "description": "The prompt to run on the fetched content",
             },
         },
-        "required": ["url"],
+        "required": ["url", "prompt"],
         "additionalProperties": False,
     }
 
