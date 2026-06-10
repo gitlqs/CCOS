@@ -2,9 +2,49 @@
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Environment-variable expansion (mirrors cc's envExpansion.ts)
+# ---------------------------------------------------------------------------
+
+_ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+
+
+def expand_env_vars(value: str) -> tuple[str, list[str]]:
+    """Expand ${VAR} and ${VAR:-default} in a string against os.environ.
+
+    Port of cc's expandEnvVarsInString (cc/src/services/mcp/envExpansion.ts).
+    Returns the expanded string plus a list of any referenced variables that
+    were unset and had no default (for error/warning reporting).
+    """
+    missing_vars: list[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        var_content = match.group(1)
+        # Split on ':-' (limit 2) to support default values while preserving
+        # any ':-' that appears inside the default itself.
+        parts = var_content.split(":-", 1)
+        var_name = parts[0]
+        default_value = parts[1] if len(parts) > 1 else None
+
+        env_value = os.environ.get(var_name)
+        if env_value is not None:
+            return env_value
+        if default_value is not None:
+            return default_value
+
+        missing_vars.append(var_name)
+        # Leave the original placeholder so it's debuggable; caller reports it.
+        return match.group(0)
+
+    expanded = _ENV_VAR_PATTERN.sub(_replace, value)
+    return expanded, missing_vars
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +94,9 @@ class MCPServerConfig:
     # Feature flags
     enabled: bool = True
 
+    # Names of ${VAR} references that could not be resolved during expansion.
+    missing_env_vars: list[str] = field(default_factory=list)
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> MCPServerConfig:
         transport_str = d.get("type", "stdio")
@@ -62,15 +105,44 @@ class MCPServerConfig:
         except ValueError:
             transport = TransportType.STDIO
 
+        missing: list[str] = []
+
+        def _expand(value: str) -> str:
+            expanded, miss = expand_env_vars(value)
+            missing.extend(miss)
+            return expanded
+
+        # Normalize args into a list before expansion.
+        raw_args = d.get("args")
+        if isinstance(raw_args, list):
+            args = list(raw_args)
+        elif raw_args:
+            args = [raw_args]
+        else:
+            args = []
+
+        command = _expand(d.get("command", ""))
+        args = [_expand(a) if isinstance(a, str) else a for a in args]
+        env = {
+            k: _expand(v) if isinstance(v, str) else v
+            for k, v in (d.get("env", {}) or {}).items()
+        }
+        url = _expand(d.get("url", ""))
+        headers = {
+            k: _expand(v) if isinstance(v, str) else v
+            for k, v in (d.get("headers", {}) or {}).items()
+        }
+
         return cls(
             type=transport,
-            command=d.get("command", ""),
-            args=d.get("args", []) if isinstance(d.get("args"), list) else [d["args"]] if d.get("args") else [],
-            env=d.get("env", {}),
+            command=command,
+            args=args,
+            env=env,
             cwd=d.get("cwd", ""),
-            url=d.get("url", ""),
-            headers=d.get("headers", {}),
+            url=url,
+            headers=headers,
             enabled=d.get("enabled", True),
+            missing_env_vars=missing,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -103,6 +175,8 @@ class MCPToolDef:
     description: str
     input_schema: dict[str, Any]
     server_name: str
+    # Tool annotations (readOnlyHint / destructiveHint / openWorldHint / title).
+    annotations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
