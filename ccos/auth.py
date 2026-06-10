@@ -28,13 +28,22 @@ class OAuthAccount:
 
 @dataclass
 class Credentials:
-    """All stored credentials."""
+    """All stored credentials.
+
+    OAuth tokens are persisted on disk under a cc-compatible ``claudeAiOauth``
+    object (camelCase ``accessToken``/``refreshToken``/``expiresAt``/``scopes``/
+    ``subscriptionType``) where ``expiresAt`` is epoch MILLISECONDS. In-memory
+    we keep the flat ``oauth_*`` attributes for backward compatibility, with
+    ``oauth_expires_at`` exposed in epoch SECONDS for existing consumers.
+    """
     # Provider -> API key
     api_keys: dict[str, str] = field(default_factory=dict)
-    # OAuth (Anthropic Console)
+    # OAuth (Anthropic Console / Claude.ai)
     oauth_token: str = ""
     oauth_refresh_token: str = ""
-    oauth_expires_at: float = 0.0  # Unix timestamp
+    oauth_expires_at: float = 0.0  # Unix timestamp (SECONDS, in-memory)
+    oauth_scopes: list[str] = field(default_factory=list)
+    oauth_subscription_type: str | None = None
     oauth_account: OAuthAccount | None = None
 
     def get_api_key(self, provider: str) -> str | None:
@@ -84,7 +93,11 @@ def _get_credentials_path() -> str:
 
 
 def load_credentials() -> Credentials:
-    """Load credentials from disk."""
+    """Load credentials from disk.
+
+    Reads cc's ``claudeAiOauth`` object (camelCase, ``expiresAt`` in ms) and
+    falls back to the legacy flat ``oauth_*`` keys for backward compatibility.
+    """
     path = _get_credentials_path()
     if not os.path.exists(path):
         return Credentials()
@@ -93,9 +106,24 @@ def load_credentials() -> Credentials:
             data = json.load(f)
         creds = Credentials()
         creds.api_keys = data.get("api_keys", {})
-        creds.oauth_token = data.get("oauth_token", "")
-        creds.oauth_refresh_token = data.get("oauth_refresh_token", "")
-        creds.oauth_expires_at = data.get("oauth_expires_at", 0.0)
+
+        oauth = data.get("claudeAiOauth")
+        if isinstance(oauth, dict):
+            creds.oauth_token = oauth.get("accessToken", "")
+            creds.oauth_refresh_token = oauth.get("refreshToken", "") or ""
+            expires_at_ms = oauth.get("expiresAt")
+            # Stored in milliseconds; expose in-memory in seconds.
+            creds.oauth_expires_at = (expires_at_ms / 1000.0) if expires_at_ms else 0.0
+            creds.oauth_scopes = list(oauth.get("scopes", []) or [])
+            creds.oauth_subscription_type = oauth.get("subscriptionType")
+        else:
+            # Legacy flat shape (oauth_expires_at was in seconds).
+            creds.oauth_token = data.get("oauth_token", "")
+            creds.oauth_refresh_token = data.get("oauth_refresh_token", "")
+            creds.oauth_expires_at = data.get("oauth_expires_at", 0.0)
+            creds.oauth_scopes = list(data.get("oauth_scopes", []) or [])
+            creds.oauth_subscription_type = data.get("oauth_subscription_type")
+
         acct = data.get("oauth_account")
         if acct:
             creds.oauth_account = OAuthAccount(
@@ -109,14 +137,24 @@ def load_credentials() -> Credentials:
 
 
 def save_credentials(creds: Credentials) -> None:
-    """Save credentials to disk with restricted permissions."""
+    """Save credentials to disk with restricted permissions.
+
+    OAuth tokens are written under a cc-compatible ``claudeAiOauth`` object
+    with ``expiresAt`` in epoch milliseconds.
+    """
     path = _get_credentials_path()
     data: dict[str, Any] = {
         "api_keys": creds.api_keys,
-        "oauth_token": creds.oauth_token,
-        "oauth_refresh_token": creds.oauth_refresh_token,
-        "oauth_expires_at": creds.oauth_expires_at,
     }
+    if creds.oauth_token:
+        data["claudeAiOauth"] = {
+            "accessToken": creds.oauth_token,
+            "refreshToken": creds.oauth_refresh_token,
+            # epoch milliseconds (mirror cc Date.now()-based expiresAt).
+            "expiresAt": int(creds.oauth_expires_at * 1000) if creds.oauth_expires_at else 0,
+            "scopes": creds.oauth_scopes,
+            "subscriptionType": creds.oauth_subscription_type,
+        }
     if creds.oauth_account:
         data["oauth_account"] = {
             "email": creds.oauth_account.email,
@@ -188,10 +226,19 @@ async def verify_api_key(provider: str, api_key: str) -> tuple[bool, str]:
 # ── Anthropic OAuth (PKCE) ─────────────────────────────────────────────────
 
 _OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
-_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
-_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+# cc prod (cc/src/constants/oauth.ts PROD_OAUTH_CONFIG).
+_OAUTH_AUTHORIZE_URL = "https://platform.claude.com/oauth/authorize"  # console flow
+# Bounces through claude.com/cai/* so CLI sign-ins connect to claude.com.
+_OAUTH_CLAUDE_AI_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"  # claude.ai flow
+_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+# ALL_OAUTH_SCOPES = union of CONSOLE_OAUTH_SCOPES and CLAUDE_AI_OAUTH_SCOPES.
+_OAUTH_SCOPES = (
+    "org:create_api_key user:profile user:inference "
+    "user:sessions:claude_code user:mcp_servers user:file_upload"
+)
+# OAuth-authenticated Anthropic API calls send this beta header.
+OAUTH_BETA_HEADER = "oauth-2025-04-20"
 
 
 def _generate_pkce_pair() -> tuple[str, str, str]:
@@ -262,6 +309,7 @@ async def exchange_oauth_code(
         headers={
             "Content-Type": "application/json",
             "User-Agent": "anthropic",
+            "anthropic-beta": OAUTH_BETA_HEADER,
         },
         method="POST",
     )
@@ -294,6 +342,7 @@ async def refresh_oauth_token(creds: Credentials) -> tuple[bool, str]:
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": "anthropic",
+                "anthropic-beta": OAUTH_BETA_HEADER,
             },
             method="POST",
         )
@@ -309,6 +358,13 @@ async def refresh_oauth_token(creds: Credentials) -> tuple[bool, str]:
     creds.oauth_refresh_token = data.get("refresh_token", creds.oauth_refresh_token)
     expires_in = data.get("expires_in", 28800)
     creds.oauth_expires_at = time.time() + expires_in
+    # Persist granted scopes / subscription type when returned.
+    scope = data.get("scope")
+    if scope:
+        creds.oauth_scopes = scope.split() if isinstance(scope, str) else list(scope)
+    sub = data.get("subscription_type") or data.get("subscriptionType")
+    if sub:
+        creds.oauth_subscription_type = sub
     return True, "Token refreshed successfully."
 
 
