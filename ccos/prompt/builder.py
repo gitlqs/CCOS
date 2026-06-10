@@ -13,6 +13,7 @@ from ccos.prompt.sections import (
     get_intro_section,
     get_output_efficiency_section,
     get_pr_section,
+    get_session_guidance_section,
     get_system_section,
     get_tone_section,
     get_tools_section,
@@ -50,6 +51,12 @@ class PromptBuilder:
     ) -> str:
         sections: list[str] = []
 
+        # ── Identity prefix (mirrors CC's always-present CLISyspromptPrefix) ──
+        # CCOS-branded rebrand — the "Claude Code"/"Anthropic" string is
+        # intentionally NOT copied; only the presence/position of an identity
+        # line matches CC.
+        sections.append("You are CCOS, an interactive CLI coding agent.")
+
         # ── Static sections (cacheable across sessions) ──────────
         sections.append(get_intro_section())
         sections.append(get_system_section())
@@ -76,6 +83,9 @@ class PromptBuilder:
 
         # ── Dynamic boundary ─────────────────────────────────────
         sections.append(DYNAMIC_BOUNDARY)
+
+        # ── Session-specific guidance (post-boundary, tool-gated) ─
+        sections.append(get_session_guidance_section(tools))
 
         # ── Plan mode context ────────────────────────────────────
         if plan_mode:
