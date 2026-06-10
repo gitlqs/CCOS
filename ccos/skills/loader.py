@@ -1,10 +1,16 @@
 """Skill loader — discovers and parses skills from disk.
 
 Skill directories (in priority order):
-  1. User:     ~/.ccos/skills/<name>/SKILL.md
-  2. Project:  <cwd>/.ccos/skills/<name>/SKILL.md
-  3. Legacy user:     ~/.ccos/commands/<name>.md
-  4. Legacy project:  <cwd>/.ccos/commands/<name>.md  (or <name>/SKILL.md)
+  1. Managed:  <managed>/.ccos/skills/<name>/SKILL.md      (policy, highest)
+  2. User:     ~/.ccos/skills/<name>/SKILL.md
+  3. Project:  every <dir>/.ccos/skills from cwd up to the git root
+               (most-specific first)
+  4. Legacy user:     ~/.ccos/commands/<name>.md
+  5. Legacy project:  <cwd>/.ccos/commands/<name>.md  (or <name>/SKILL.md)
+
+Modern /skills/ directories are scanned FLATLY: only <base>/<name>/SKILL.md is
+loaded (no recursion, no namespacing, single .md files ignored). Recursive
+namespacing and single-.md support apply only to the legacy /commands/ dirs.
 
 Skills are markdown files with optional YAML frontmatter.
 """
@@ -12,15 +18,22 @@ Skills are markdown files with optional YAML frontmatter.
 from __future__ import annotations
 
 import os
+import re
+import sys
 from pathlib import Path
 from typing import Any
 
+from ccos.skills.arguments import parse_argument_names
 from ccos.skills.frontmatter import (
-    normalize_bool_field,
-    normalize_list_field,
+    parse_bool_field,
     parse_frontmatter,
 )
 from ccos.skills.types import ExecutionContext, SkillDefinition, SkillSource
+
+# Files named SKILL.md (case-insensitive) are the modern skill manifest.
+_SKILL_FILE_RE = re.compile(r"^skill\.md$", re.IGNORECASE)
+_BRACE_GROUP_RE = re.compile(r"^([^{]*)\{([^}]+)\}(.*)$")
+_HEADER_RE = re.compile(r"^#+\s+(.+)$")
 
 
 def get_user_skills_dir() -> Path:
@@ -28,22 +41,88 @@ def get_user_skills_dir() -> Path:
     return Path.home() / ".ccos" / "skills"
 
 
+def get_managed_skills_dir() -> Path | None:
+    """Return the platform managed/policy skills directory, if applicable.
+
+    Mirrors cc's getManagedFilePath() + '.claude/skills' tier, using CCOS's
+    '.ccos' config dir. Returns None when no managed root applies.
+    """
+    if sys.platform == "win32":
+        program_data = os.environ.get("PROGRAMDATA")
+        if program_data:
+            return Path(program_data) / "CCOS" / ".ccos" / "skills"
+        return None
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/CCOS/.ccos/skills")
+    # Linux / other POSIX
+    return Path("/etc/ccos/.ccos/skills")
+
+
+def _find_git_root(start: Path) -> Path | None:
+    """Walk up from ``start`` looking for a directory containing .git."""
+    current = start.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def get_project_dirs_up_to_root(cwd: str) -> list[Path]:
+    """Collect every <dir>/.ccos/skills from cwd up to the git root (or home).
+
+    Returns existing directories, most-specific (cwd) first. Stops at the git
+    root if cwd is inside a repo, otherwise stops before home. Mirrors cc's
+    getProjectDirsUpToHome('skills', cwd).
+    """
+    home = Path.home().resolve()
+    git_root = _find_git_root(Path(cwd))
+    current = Path(cwd).resolve()
+    dirs: list[Path] = []
+
+    while True:
+        # Don't scan home here — it is loaded separately as the user dir.
+        if current == home:
+            break
+
+        candidate = current / ".ccos" / "skills"
+        if candidate.is_dir():
+            dirs.append(candidate)
+
+        # Stop after processing the git root.
+        if git_root is not None and current == git_root:
+            break
+
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    return dirs
+
+
 def get_skill_directories(cwd: str) -> list[tuple[Path, SkillSource]]:
     """Return all skill directories to scan, in priority order.
 
-    User-level (~/.ccos/) takes precedence over project-level.
+    Precedence: managed > user > project(deepest..shallowest) > legacy.
     """
     dirs: list[tuple[Path, SkillSource]] = []
     home = Path.home()
 
-    # User skills (highest priority)
+    # Managed/policy skills (highest priority)
+    managed_skills = get_managed_skills_dir()
+    if managed_skills is not None and managed_skills.is_dir():
+        dirs.append((managed_skills, SkillSource.MANAGED))
+
+    # User skills
     user_skills = home / ".ccos" / "skills"
     if user_skills.is_dir():
         dirs.append((user_skills, SkillSource.USER))
 
-    # Project skills
-    project_skills = Path(cwd) / ".ccos" / "skills"
-    if project_skills.is_dir():
+    # Project skills — walk cwd up to the git root, most-specific first.
+    for project_skills in get_project_dirs_up_to_root(cwd):
         dirs.append((project_skills, SkillSource.PROJECT))
 
     # Legacy: user commands
@@ -59,19 +138,41 @@ def get_skill_directories(cwd: str) -> list[tuple[Path, SkillSource]]:
     return dirs
 
 
+_LEGACY_SOURCES = (SkillSource.LEGACY_USER, SkillSource.LEGACY_PROJECT)
+
+
 def load_all_skills(cwd: str) -> list[SkillDefinition]:
     """Load all skills from all skill directories.
 
-    Returns deduplicated list (first-wins by name).
+    Deduplicated by physical file identity (realpath, first-wins) to handle
+    symlinks/overlap, then by name (first-wins) so precedence is preserved.
     """
     seen_names: set[str] = set()
+    seen_files: set[str] = set()
     skills: list[SkillDefinition] = []
 
     for skill_dir, source in get_skill_directories(cwd):
-        for skill in _load_skills_from_dir(skill_dir, source):
-            if skill.name not in seen_names:
-                seen_names.add(skill.name)
-                skills.append(skill)
+        if source in _LEGACY_SOURCES:
+            loaded = _load_legacy_skills_from_dir(skill_dir, source)
+        else:
+            loaded = _load_modern_skills_from_dir(skill_dir, source)
+
+        for skill in loaded:
+            # Dedup by physical file (handles symlinks / overlapping dirs).
+            try:
+                file_id = os.path.realpath(skill.loaded_from)
+            except OSError:
+                file_id = ""
+            if file_id and file_id in seen_files:
+                continue
+
+            if skill.name in seen_names:
+                continue
+
+            if file_id:
+                seen_files.add(file_id)
+            seen_names.add(skill.name)
+            skills.append(skill)
 
     return skills
 
@@ -84,16 +185,15 @@ def load_skill_by_name(name: str, cwd: str) -> SkillDefinition | None:
     return None
 
 
-def _load_skills_from_dir(
+def _load_modern_skills_from_dir(
     base_dir: Path,
     source: SkillSource,
-    prefix: str = "",
 ) -> list[SkillDefinition]:
-    """Recursively load skills from a directory.
+    """Flat scan of a modern /skills/ directory.
 
-    Modern format:  base_dir/<name>/SKILL.md
-    Legacy format:  base_dir/<name>.md
-    Nested:         base_dir/<ns>/<name>/SKILL.md  ->  name = "ns:name"
+    Only ``base_dir/<name>/SKILL.md`` is loaded. No recursion, no namespacing,
+    and bare ``<name>.md`` files are ignored (matching cc's
+    loadSkillsFromSkillsDir).
     """
     skills: list[SkillDefinition] = []
 
@@ -102,7 +202,47 @@ def _load_skills_from_dir(
 
     try:
         entries = sorted(base_dir.iterdir())
-    except PermissionError:
+    except (PermissionError, OSError):
+        return skills
+
+    for entry in entries:
+        if entry.name.startswith(".") or entry.name.startswith("_"):
+            continue
+        if not entry.is_dir():
+            # Single .md files are NOT supported in /skills/ directories.
+            continue
+
+        skill_file = entry / "SKILL.md"
+        if not skill_file.is_file():
+            continue
+
+        skill = _parse_skill_file(skill_file, entry.name, source)
+        if skill:
+            skills.append(skill)
+
+    return skills
+
+
+def _load_legacy_skills_from_dir(
+    base_dir: Path,
+    source: SkillSource,
+    prefix: str = "",
+) -> list[SkillDefinition]:
+    """Recursively load skills from a legacy /commands/ directory.
+
+    Legacy format:  base_dir/<name>.md
+    Skill format:   base_dir/<name>/SKILL.md            ->  name = "<name>"
+    Nested:         base_dir/<ns>/<name>/SKILL.md       ->  name = "ns:name"
+    Nested cmd:     base_dir/<ns>/<name>.md             ->  name = "ns:name"
+    """
+    skills: list[SkillDefinition] = []
+
+    if not base_dir.is_dir():
+        return skills
+
+    try:
+        entries = sorted(base_dir.iterdir())
+    except (PermissionError, OSError):
         return skills
 
     for entry in entries:
@@ -110,20 +250,22 @@ def _load_skills_from_dir(
             continue
 
         if entry.is_dir():
-            # Check for SKILL.md in this directory
+            # A directory holding a SKILL.md takes the directory's name.
             skill_file = entry / "SKILL.md"
             if skill_file.is_file():
-                name = f"{prefix}{entry.name}" if not prefix else f"{prefix}:{entry.name}"
+                name = f"{prefix}:{entry.name}" if prefix else entry.name
                 skill = _parse_skill_file(skill_file, name, source)
                 if skill:
                     skills.append(skill)
             else:
-                # Recurse into subdirectory for nested namespaces
+                # Recurse, building the namespace prefix.
                 sub_prefix = f"{prefix}:{entry.name}" if prefix else entry.name
-                skills.extend(_load_skills_from_dir(entry, source, sub_prefix))
+                skills.extend(
+                    _load_legacy_skills_from_dir(entry, source, sub_prefix)
+                )
 
         elif entry.is_file() and entry.suffix == ".md":
-            # Legacy: direct .md files (commands style)
+            # Legacy single .md files (commands style).
             name_stem = entry.stem
             if prefix:
                 name_stem = f"{prefix}:{name_stem}"
@@ -132,6 +274,158 @@ def _load_skills_from_dir(
                 skills.append(skill)
 
     return skills
+
+
+def parse_allowed_tools(value: Any) -> list[str]:
+    """Parse the ``allowed-tools`` frontmatter field.
+
+    Mirrors cc's parseSlashCommandToolsFromFrontmatter: accepts a string or a
+    YAML list; strings are comma-split while respecting parentheses (so specs
+    like ``Bash(git status:*)`` survive); ``*`` collapses the whole list to
+    ``['*']``; missing/empty yields ``[]``.
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        items: list[str] = []
+        for entry in value:
+            items.extend(_split_tool_string(str(entry)))
+    elif isinstance(value, str):
+        items = _split_tool_string(value)
+    else:
+        return []
+
+    if "*" in items:
+        return ["*"]
+    return items
+
+
+def _split_tool_string(value: str) -> list[str]:
+    """Split a tool string on commas, but not inside parentheses."""
+    parts: list[str] = []
+    current = ""
+    depth = 0
+    for ch in value:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            current += ch
+        elif ch == "," and depth == 0:
+            trimmed = current.strip()
+            if trimmed:
+                parts.append(trimmed)
+            current = ""
+        else:
+            current += ch
+    trimmed = current.strip()
+    if trimmed:
+        parts.append(trimmed)
+    return parts
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    """Expand brace groups in a glob pattern (cc's expandBraces)."""
+    match = _BRACE_GROUP_RE.match(pattern)
+    if not match:
+        return [pattern]
+
+    prefix = match.group(1) or ""
+    alternatives = match.group(2) or ""
+    suffix = match.group(3) or ""
+
+    expanded: list[str] = []
+    for alt in alternatives.split(","):
+        combined = prefix + alt.strip() + suffix
+        expanded.extend(_expand_braces(combined))
+    return expanded
+
+
+def _split_path_in_frontmatter(value: Any) -> list[str]:
+    """Comma-split (honoring braces) then brace-expand a paths value.
+
+    Mirrors cc's splitPathInFrontmatter.
+    """
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            out.extend(_split_path_in_frontmatter(item))
+        return out
+    if not isinstance(value, str):
+        return []
+
+    parts: list[str] = []
+    current = ""
+    brace_depth = 0
+    for ch in value:
+        if ch == "{":
+            brace_depth += 1
+            current += ch
+        elif ch == "}":
+            brace_depth -= 1
+            current += ch
+        elif ch == "," and brace_depth == 0:
+            trimmed = current.strip()
+            if trimmed:
+                parts.append(trimmed)
+            current = ""
+        else:
+            current += ch
+    trimmed = current.strip()
+    if trimmed:
+        parts.append(trimmed)
+
+    expanded: list[str] = []
+    for part in parts:
+        if part:
+            expanded.extend(_expand_braces(part))
+    return expanded
+
+
+def parse_skill_paths(value: Any) -> list[str]:
+    """Parse the ``paths`` frontmatter field into normalized glob patterns.
+
+    Mirrors cc's parseSkillPaths: comma-split honoring braces + brace-expand,
+    strip a trailing ``/**`` from each pattern, drop empties, and treat an
+    all-``**`` result as no paths (returns []).
+    """
+    if not value:
+        return []
+
+    patterns: list[str] = []
+    for pattern in _split_path_in_frontmatter(value):
+        if pattern.endswith("/**"):
+            pattern = pattern[:-3]
+        if pattern:
+            patterns.append(pattern)
+
+    if not patterns or all(p == "**" for p in patterns):
+        return []
+
+    return patterns
+
+
+def _extract_description_from_markdown(
+    content: str,
+    default_label: str,
+) -> str:
+    """Derive a description from the first non-empty markdown line.
+
+    Strips a leading header marker, truncates to 100 chars (``text[:97] +
+    '...'``), and falls back to ``default_label`` if there is no non-empty
+    line. Mirrors cc's extractDescriptionFromMarkdown.
+    """
+    for line in content.split("\n"):
+        trimmed = line.strip()
+        if trimmed:
+            header = _HEADER_RE.match(trimmed)
+            text = header.group(1) if header else trimmed
+            if len(text) > 100:
+                return text[:97] + "..."
+            return text
+    return default_label
 
 
 def _parse_skill_file(
@@ -147,6 +441,9 @@ def _parse_skill_file(
 
     frontmatter, content = parse_frontmatter(raw)
 
+    is_legacy = source in _LEGACY_SOURCES
+    default_desc_label = "Custom command" if is_legacy else "Skill"
+
     # Build definition
     skill = SkillDefinition(
         name=name,
@@ -160,30 +457,30 @@ def _parse_skill_file(
     if "name" in frontmatter:
         skill.display_name = str(frontmatter["name"])
 
-    if "description" in frontmatter:
-        skill.description = str(frontmatter["description"])
-    elif content:
-        # Extract first line/sentence as description
-        first_line = content.split("\n")[0].strip()
-        if first_line and not first_line.startswith("#"):
-            skill.description = first_line[:120]
+    raw_description = frontmatter.get("description")
+    if isinstance(raw_description, str) and raw_description.strip():
+        skill.description = raw_description.strip()
+    else:
+        # Fall back to the markdown body (cc's extractDescriptionFromMarkdown).
+        skill.description = _extract_description_from_markdown(
+            content, default_desc_label
+        )
 
     if "when_to_use" in frontmatter:
         skill.when_to_use = str(frontmatter["when_to_use"])
 
     # Arguments
     if "arguments" in frontmatter:
-        skill.argument_names = normalize_list_field(frontmatter["arguments"])
+        skill.argument_names = parse_argument_names(frontmatter["arguments"])
 
+    # argument-hint comes ONLY from the literal frontmatter field; cc never
+    # synthesizes one from the argument names.
     if "argument-hint" in frontmatter:
         skill.argument_hint = str(frontmatter["argument-hint"])
-    elif skill.argument_names:
-        # Auto-generate hint from argument names
-        skill.argument_hint = " ".join(f"[{a}]" for a in skill.argument_names)
 
     # Tools
     if "allowed-tools" in frontmatter:
-        skill.allowed_tools = normalize_list_field(frontmatter["allowed-tools"])
+        skill.allowed_tools = parse_allowed_tools(frontmatter["allowed-tools"])
 
     # Execution
     if "context" in frontmatter:
@@ -202,13 +499,13 @@ def _parse_skill_file(
     if "effort" in frontmatter:
         skill.effort = str(frontmatter["effort"])
 
-    # Visibility
+    # Visibility — strict cc boolean semantics (only true / "true").
     if "user-invocable" in frontmatter:
-        skill.user_invocable = normalize_bool_field(frontmatter["user-invocable"])
+        skill.user_invocable = parse_bool_field(frontmatter["user-invocable"])
 
     if "disable-model-invocation" in frontmatter:
-        skill.disable_model_invocation = normalize_bool_field(
-            frontmatter["disable-model-invocation"], default=False
+        skill.disable_model_invocation = parse_bool_field(
+            frontmatter["disable-model-invocation"]
         )
 
     # Metadata
@@ -216,7 +513,7 @@ def _parse_skill_file(
         skill.version = str(frontmatter["version"])
 
     if "paths" in frontmatter:
-        skill.paths = normalize_list_field(frontmatter["paths"])
+        skill.paths = parse_skill_paths(frontmatter["paths"])
 
     # Hooks
     if "hooks" in frontmatter and isinstance(frontmatter["hooks"], dict):
