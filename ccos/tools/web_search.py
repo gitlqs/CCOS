@@ -4,29 +4,70 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+from datetime import datetime
 from typing import Any
 
 from ccos.tools.base import Tool, ToolContext, ToolOutput
 
 
+def _build_web_search_description() -> str:
+    # Mirror cc's getLocalMonthYear() (e.g. "June 2026").
+    current_month_year = datetime.now().strftime("%B %Y")
+    return (
+        "\n"
+        "- Allows Claude to search the web and use the results to inform responses\n"
+        "- Provides up-to-date information for current events and recent data\n"
+        "- Returns search result information formatted as search result blocks, "
+        "including links as markdown hyperlinks\n"
+        "- Use this tool for accessing information beyond Claude's knowledge cutoff\n"
+        "- Searches are performed automatically within a single API call\n"
+        "\n"
+        "CRITICAL REQUIREMENT - You MUST follow this:\n"
+        "  - After answering the user's question, you MUST include a \"Sources:\" "
+        "section at the end of your response\n"
+        "  - In the Sources section, list all relevant URLs from the search results "
+        "as markdown hyperlinks: [Title](URL)\n"
+        "  - This is MANDATORY - never skip including sources in your response\n"
+        "  - Example format:\n"
+        "\n"
+        "    [Your answer here]\n"
+        "\n"
+        "    Sources:\n"
+        "    - [Source Title 1](https://example.com/1)\n"
+        "    - [Source Title 2](https://example.com/2)\n"
+        "\n"
+        "Usage notes:\n"
+        "  - Domain filtering is supported to include or block specific websites\n"
+        "  - Web search is only available in the US\n"
+        "\n"
+        "IMPORTANT - Use the correct year in search queries:\n"
+        f"  - The current month is {current_month_year}. You MUST use this year when "
+        "searching for recent information, documentation, or current events.\n"
+        "  - Example: If the user asks for \"latest React docs\", search for "
+        "\"React documentation\" with the current year, NOT last year\n"
+    )
+
+
 class WebSearchTool(Tool):
     name = "WebSearch"
-    description = (
-        "Search the web for real-time information.\n\n"
-        "Use this when you need current information that may not be in your training data.\n"
-        "Returns search results with titles, URLs, and snippets."
-    )
+    description = _build_web_search_description()
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "The search query",
+                "description": "The search query to use",
+                "minLength": 2,
             },
-            "domains": {
+            "allowed_domains": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional list of domains to restrict search to",
+                "description": "Only include search results from these domains",
+            },
+            "blocked_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Never include search results from these domains",
             },
         },
         "required": ["query"],
@@ -35,12 +76,26 @@ class WebSearchTool(Tool):
 
     async def execute(self, params: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         query = params["query"]
-        domains = params.get("domains", [])
+        allowed_domains = params.get("allowed_domains") or []
+        blocked_domains = params.get("blocked_domains") or []
 
-        # Build domain-restricted query if needed
-        if domains:
-            domain_parts = " OR ".join(f"site:{d}" for d in domains)
-            query = f"{query} ({domain_parts})"
+        if allowed_domains and blocked_domains:
+            return ToolOutput(
+                content=(
+                    "Error: Cannot specify both allowed_domains and "
+                    "blocked_domains in the same request"
+                ),
+                is_error=True,
+            )
+
+        # Build a domain-filtered query: allowed_domains as `site:` OR include,
+        # blocked_domains as `-site:` exclude.
+        if allowed_domains:
+            include_parts = " OR ".join(f"site:{d}" for d in allowed_domains)
+            query = f"{query} ({include_parts})"
+        elif blocked_domains:
+            exclude_parts = " ".join(f"-site:{d}" for d in blocked_domains)
+            query = f"{query} {exclude_parts}"
 
         # Try using the Brave Search API or fallback
         import os
