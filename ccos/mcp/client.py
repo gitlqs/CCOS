@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, Callable
 
@@ -30,8 +31,18 @@ MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_BASE_DELAY = 1.0  # seconds
 RECONNECT_MAX_DELAY = 30.0  # seconds
 
-# Result size limits
-MAX_RESULT_SIZE = 100_000  # 100KB
+# Cap on captured server instructions (matches cc's MAX_MCP_DESCRIPTION_LENGTH).
+MAX_MCP_DESCRIPTION_LENGTH = 2048
+
+# Default MCP tool-output token budget (matches cc's
+# DEFAULT_MAX_MCP_OUTPUT_TOKENS); overridable via MAX_MCP_OUTPUT_TOKENS.
+# cc approximates chars as tokens * 4.
+DEFAULT_MAX_MCP_OUTPUT_TOKENS = 25000
+
+# Newest MCP protocol revision CCOS advertises. The server echoes back its
+# negotiated protocolVersion in the initialize result; CCOS accepts whatever it
+# returns rather than requiring an exact match.
+MCP_PROTOCOL_VERSION = "2024-11-05"
 
 
 class MCPConnection:
@@ -49,6 +60,9 @@ class MCPConnection:
         self._error: str = ""
         self._reconnect_attempts = 0
         self._server_info: dict[str, Any] = {}
+        self._instructions: str = ""
+        self._capabilities: dict[str, Any] = {}
+        self._protocol_version: str = ""
         self._on_tools_changed: Callable[[], None] | None = None
         self._on_resources_changed: Callable[[], None] | None = None
 
@@ -80,6 +94,21 @@ class MCPConnection:
     def server_info(self) -> dict[str, Any]:
         return self._server_info
 
+    @property
+    def instructions(self) -> str:
+        """Per-server usage guidance returned by initialize (capped at 2048)."""
+        return self._instructions
+
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """Server capabilities advertised during initialize."""
+        return self._capabilities
+
+    @property
+    def protocol_version(self) -> str:
+        """The protocolVersion the server negotiated in its initialize result."""
+        return self._protocol_version
+
     async def connect(self) -> None:
         """Start the transport and initialize the MCP session."""
         if not self.config.enabled:
@@ -92,17 +121,24 @@ class MCPConnection:
         try:
             self._transport = create_transport(self.config)
             self._transport.on_notification = self._handle_notification
+            # Answer server-initiated requests (e.g. roots/list) so servers
+            # that query our roots don't stall after init.
+            self._transport.on_request = self._handle_request
             await self._transport.start()
 
-            # MCP initialize handshake
+            # MCP initialize handshake. clientInfo identifies as Claude Code to
+            # match cc. Capabilities advertise empty `roots` and `elicitation`
+            # objects — non-empty sub-objects break strict (Java/Spring AI)
+            # servers, and CCOS does not implement sampling so it isn't sent.
             init_result = await self._send_request("initialize", {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {
-                    "roots": {"listChanged": True},
-                    "sampling": {},
+                    "roots": {},
+                    "elicitation": {},
                 },
                 "clientInfo": {
-                    "name": "ccos",
+                    "name": "claude-code",
+                    "title": "Claude Code",
                     "version": "0.1.0",
                 },
             })
@@ -113,17 +149,31 @@ class MCPConnection:
                 )
 
             self._server_info = init_result.get("serverInfo", {})
+            self._capabilities = init_result.get("capabilities", {}) or {}
+            # Accept whatever protocolVersion the server negotiated rather than
+            # requiring an exact match (the SDK negotiates this in cc).
+            self._protocol_version = init_result.get("protocolVersion", "") or ""
+
+            # Capture per-server instructions, capped at MAX_MCP_DESCRIPTION_LENGTH.
+            raw_instructions = init_result.get("instructions", "") or ""
+            if len(raw_instructions) > MAX_MCP_DESCRIPTION_LENGTH:
+                raw_instructions = (
+                    raw_instructions[:MAX_MCP_DESCRIPTION_LENGTH] + "… [truncated]"
+                )
+            self._instructions = raw_instructions
+
             logger.debug(
-                "MCP %s: initialized — serverInfo=%s capabilities=%s",
+                "MCP %s: initialized — serverInfo=%s capabilities=%s protocolVersion=%s",
                 self.name,
-                init_result.get("serverInfo"),
-                init_result.get("capabilities"),
+                self._server_info,
+                self._capabilities,
+                self._protocol_version,
             )
 
             # Send initialized notification
             await self._send_notification("notifications/initialized", {})
 
-            # Fetch capabilities
+            # Fetch capabilities (gated on advertised server capabilities)
             await self._fetch_tools()
             await self._fetch_resources()
             await self._fetch_prompts()
@@ -144,6 +194,9 @@ class MCPConnection:
         self._tools.clear()
         self._resources.clear()
         self._prompts.clear()
+        self._instructions = ""
+        self._capabilities = {}
+        self._protocol_version = ""
 
     async def reconnect(self) -> None:
         """Attempt to reconnect with exponential backoff."""
@@ -170,15 +223,23 @@ class MCPConnection:
             f"Failed to reconnect after {MAX_RECONNECT_ATTEMPTS} attempts"
         )
 
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Call a tool on the MCP server and return the result text."""
+    async def call_tool(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[str, bool]:
+        """Call a tool on the MCP server.
+
+        Returns (result_text, is_error). is_error is True when the server set
+        isError: true on the result (protocol-level error), so the model sees
+        it as an error tool_result block — matching cc, which throws
+        McpToolCallError on isError.
+        """
         result = await self._send_request("tools/call", {
             "name": tool_name,
             "arguments": arguments,
         })
 
         if result is None:
-            return "Error: No response from MCP server"
+            return "Error: No response from MCP server", True
 
         return self._format_tool_result(result)
 
@@ -202,6 +263,35 @@ class MCPConnection:
                 return str(first)
         return str(result)
 
+    async def read_resource_contents(self, uri: str) -> list[dict[str, Any]]:
+        """Read a resource and return its raw contents blocks.
+
+        Used by ReadMcpResourceTool. Each entry mirrors cc's shape:
+        {uri, mimeType?, text?, blobSavedTo?}. Binary blobs are surfaced as a
+        descriptive text note (CCOS has no on-disk blob persistence layer).
+        """
+        result = await self._send_request("resources/read", {"uri": uri})
+        if not isinstance(result, dict):
+            return []
+
+        contents: list[dict[str, Any]] = []
+        for c in result.get("contents", []):
+            if not isinstance(c, dict):
+                continue
+            entry: dict[str, Any] = {"uri": c.get("uri", uri)}
+            if c.get("mimeType"):
+                entry["mimeType"] = c["mimeType"]
+            if "text" in c:
+                entry["text"] = c["text"]
+            elif "blob" in c:
+                mime = c.get("mimeType", "application/octet-stream")
+                entry["text"] = (
+                    f"[Resource from {self.name} at {entry['uri']}] "
+                    f"Binary content ({mime}, {len(c['blob'])} bytes base64)"
+                )
+            contents.append(entry)
+        return contents
+
     async def get_prompt(
         self, prompt_name: str, arguments: dict[str, str] | None = None
     ) -> dict[str, Any]:
@@ -223,6 +313,19 @@ class MCPConnection:
             asyncio.create_task(self._refresh_resources())
         elif method == "notifications/prompts/list_changed":
             asyncio.create_task(self._refresh_prompts())
+
+    def _handle_request(
+        self, method: str, params: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Handle server-initiated requests (those carrying an id).
+
+        We advertise the `roots` capability, so we must answer roots/list with
+        the current working directory as a single file:// root — matching cc's
+        ListRootsRequestSchema handler. Returning None signals "unsupported".
+        """
+        if method == "roots/list":
+            return {"roots": [{"uri": f"file://{os.getcwd()}"}]}
+        return None
 
     async def _refresh_tools(self) -> None:
         """Re-fetch tools after notification."""
@@ -250,6 +353,9 @@ class MCPConnection:
     # -- Internal fetchers ---------------------------------------------------
 
     async def _fetch_tools(self) -> None:
+        # Gate on the advertised capability, like cc — avoids spurious requests.
+        if not self._capabilities.get("tools"):
+            return
         try:
             result = await self._send_request("tools/list", {})
         except RuntimeError as e:
@@ -266,6 +372,7 @@ class MCPConnection:
                     description=t.get("description", ""),
                     input_schema=t.get("inputSchema", {}),
                     server_name=self.name,
+                    annotations=t.get("annotations", {}) or {},
                 )
                 for t in raw_tools
             ]
@@ -273,6 +380,8 @@ class MCPConnection:
             logger.debug("MCP %s: tools/list returned %r", self.name, result)
 
     async def _fetch_resources(self) -> None:
+        if not self._capabilities.get("resources"):
+            return
         try:
             result = await self._send_request("resources/list", {})
         except RuntimeError:
@@ -290,6 +399,8 @@ class MCPConnection:
             ]
 
     async def _fetch_prompts(self) -> None:
+        if not self._capabilities.get("prompts"):
+            return
         try:
             result = await self._send_request("prompts/list", {})
         except RuntimeError:
@@ -340,33 +451,88 @@ class MCPConnection:
                 pass
             self._transport = None
 
-    @staticmethod
-    def _format_tool_result(result: dict[str, Any]) -> str:
-        """Format MCP tool result into text, with size limits."""
-        content = result.get("content", [])
-        if isinstance(content, list):
-            texts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        texts.append(block.get("text", ""))
-                    elif block.get("type") == "image":
-                        mime = block.get("mimeType", "unknown")
-                        texts.append(f"[Image: {mime}]")
-                    elif block.get("type") == "resource":
-                        uri = block.get("resource", {}).get("uri", "?")
-                        texts.append(f"[Resource: {uri}]")
-            output = "\n".join(texts)
-        else:
-            output = str(content)
+    def _format_tool_result(self, result: dict[str, Any]) -> tuple[str, bool]:
+        """Format an MCP tool result into (text, is_error).
 
-        # Truncate large results
-        if len(output) > MAX_RESULT_SIZE:
-            output = output[:MAX_RESULT_SIZE] + (
-                f"\n\n⚠️ Output truncated at {MAX_RESULT_SIZE:,} bytes "
-                f"(original: {len(output):,} bytes)"
+        Mirrors cc's result handling:
+        - isError: true -> surfaced as an error tool_result (cc throws
+          McpToolCallError); the server's text content is kept as the body.
+        - result shape precedence: toolResult, then structuredContent, then the
+          content-block array (transformMCPResult).
+        - output is truncated by a token budget with cc's verbatim guidance.
+        """
+        is_error = bool(result.get("isError")) if isinstance(result, dict) else False
+
+        text = self._extract_result_text(result)
+        text = self._truncate_output(text)
+        if not text:
+            text = json.dumps(result)
+        return text, is_error
+
+    def _extract_result_text(self, result: dict[str, Any]) -> str:
+        """Extract the textual payload from a tool result.
+
+        Precedence matches cc's transformMCPResult: toolResult ->
+        structuredContent -> content-block array.
+        """
+        if isinstance(result, dict):
+            if "toolResult" in result:
+                return str(result["toolResult"])
+            sc = result.get("structuredContent")
+            if sc is not None:
+                return json.dumps(sc)
+
+        content = result.get("content", []) if isinstance(result, dict) else []
+        if isinstance(content, list):
+            texts: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    texts.append(block.get("text", ""))
+                elif btype == "image":
+                    mime = block.get("mimeType", "unknown")
+                    texts.append(f"[Image: {mime}]")
+                elif btype == "resource":
+                    resource = block.get("resource", {}) or {}
+                    uri = resource.get("uri", "?")
+                    prefix = f"[Resource from {self.name} at {uri}] "
+                    if "text" in resource:
+                        texts.append(f"{prefix}{resource.get('text', '')}")
+                    else:
+                        texts.append(prefix.rstrip())
+                elif btype == "resource_link":
+                    name = block.get("name", "")
+                    uri = block.get("uri", "")
+                    line = f"[Resource link: {name}] {uri}"
+                    desc = block.get("description")
+                    if desc:
+                        line += f" ({desc})"
+                    texts.append(line)
+            return "\n".join(texts)
+        return str(content)
+
+    @staticmethod
+    def _truncate_output(output: str) -> str:
+        """Truncate by a token budget, appending cc's verbatim guidance."""
+        try:
+            max_tokens = int(os.environ.get("MAX_MCP_OUTPUT_TOKENS") or 0)
+        except ValueError:
+            max_tokens = 0
+        if max_tokens <= 0:
+            max_tokens = DEFAULT_MAX_MCP_OUTPUT_TOKENS
+        max_chars = max_tokens * 4
+        if len(output) > max_chars:
+            output = output[:max_chars] + (
+                f"\n\n[OUTPUT TRUNCATED - exceeded {max_tokens} token limit]\n\n"
+                "The tool output was truncated. If this MCP server provides "
+                "pagination or filtering tools, use them to retrieve specific "
+                "portions of the data. If pagination is not available, inform "
+                "the user that you are working with truncated output and results "
+                "may be incomplete."
             )
-        return output if output else json.dumps(result)
+        return output
 
 
 class MCPManager:
@@ -466,13 +632,39 @@ class MCPManager:
 
     async def call_tool(
         self, server_name: str, tool_name: str, arguments: dict[str, Any]
-    ) -> str:
+    ) -> tuple[str, bool]:
+        """Call a tool and return (result_text, is_error)."""
         conn = self._connections.get(server_name)
         if not conn:
-            return f"Error: MCP server '{server_name}' not found"
+            return f"Error: MCP server '{server_name}' not found", True
         if not conn.is_connected:
-            return f"Error: MCP server '{server_name}' is not connected (state: {conn.state.value})"
+            return (
+                f"Error: MCP server '{server_name}' is not connected "
+                f"(state: {conn.state.value})",
+                True,
+            )
         return await conn.call_tool(tool_name, arguments)
+
+    def get_mcp_instructions_section(self) -> str | None:
+        """Build the `# MCP Server Instructions` system-prompt section.
+
+        Mirrors cc's getMcpInstructions verbatim. Returns None when no
+        connected server has provided instructions.
+        """
+        blocks = [
+            f"## {conn.name}\n{conn.instructions}"
+            for conn in self._connections.values()
+            if conn.is_connected and conn.instructions
+        ]
+        if not blocks:
+            return None
+        body = "\n\n".join(blocks)
+        return (
+            "# MCP Server Instructions\n\n"
+            "The following MCP servers have provided instructions for how to "
+            "use their tools and resources:\n\n"
+            f"{body}"
+        )
 
     def get_status_summary(self) -> list[dict[str, Any]]:
         """Get status of all servers for display."""

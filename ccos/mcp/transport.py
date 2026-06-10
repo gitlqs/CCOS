@@ -27,6 +27,41 @@ class MCPTransport(ABC):
     """Abstract base for MCP transports."""
 
     on_notification: Callable[[str, dict[str, Any]], None] | None = None
+    # Handler for server-initiated *requests* (messages carrying both a
+    # `method` and an `id`). Returns a JSON-RPC result dict, or None to signal
+    # the method is unsupported.
+    on_request: Callable[[str, dict[str, Any]], dict[str, Any] | None] | None = None
+
+    def _dispatch_inbound_request(
+        self, method: str, params: dict[str, Any], request_id: Any
+    ) -> None:
+        """Invoke on_request and send back a JSON-RPC response.
+
+        Used by transports that can write back to the server (stdio, ws). The
+        send is scheduled on the event loop since dispatch runs synchronously.
+        """
+        if self.on_request is None:
+            result: dict[str, Any] | None = None
+        else:
+            try:
+                result = self.on_request(method, params)
+            except Exception:
+                result = None
+
+        if result is None:
+            response: JSONRPCMessage = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"},
+            }
+        else:
+            response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+        try:
+            asyncio.get_event_loop().create_task(self._send_raw(response))
+        except RuntimeError:
+            # No running loop (e.g. during teardown) — best effort, drop it.
+            pass
 
     @abstractmethod
     async def start(self) -> None:
@@ -261,8 +296,13 @@ class StdioTransport(MCPTransport):
 
     def _dispatch_message(self, msg: JSONRPCMessage) -> None:
         """Route a received message to the right handler."""
-        if "id" in msg:
-            # Response to a request
+        if "id" in msg and "method" in msg:
+            # Server-initiated request — answer it (e.g. roots/list).
+            self._dispatch_inbound_request(
+                msg.get("method", ""), msg.get("params", {}), msg["id"]
+            )
+        elif "id" in msg:
+            # Response to a request we sent
             req_id = msg["id"]
             fut = self._pending_responses.pop(req_id, None)
             if fut and not fut.done():
@@ -273,7 +313,7 @@ class StdioTransport(MCPTransport):
                     ))
                 else:
                     fut.set_result(msg.get("result"))
-        elif "method" in msg and "id" not in msg:
+        elif "method" in msg:
             # Server-initiated notification
             method = msg.get("method", "")
             params = msg.get("params", {})
@@ -421,7 +461,13 @@ class SSETransport(MCPTransport):
             self._dispatch_message(msg)
 
     def _dispatch_message(self, msg: JSONRPCMessage) -> None:
-        if "id" in msg and "method" not in msg:
+        if "id" in msg and "method" in msg:
+            # Server-initiated request — answer it (e.g. roots/list). The
+            # response is POSTed back to the message endpoint via _send_raw.
+            self._dispatch_inbound_request(
+                msg.get("method", ""), msg.get("params", {}), msg["id"]
+            )
+        elif "id" in msg:
             # Response
             req_id = msg["id"]
             fut = self._pending_responses.pop(req_id, None)
@@ -433,7 +479,7 @@ class SSETransport(MCPTransport):
                     ))
                 else:
                     fut.set_result(msg.get("result"))
-        elif "method" in msg and "id" not in msg:
+        elif "method" in msg:
             # Notification
             method = msg.get("method", "")
             params = msg.get("params", {})
@@ -662,7 +708,12 @@ class WebSocketTransport(MCPTransport):
             pass
 
     def _dispatch_message(self, msg: JSONRPCMessage) -> None:
-        if "id" in msg and "method" not in msg:
+        if "id" in msg and "method" in msg:
+            # Server-initiated request — answer it (e.g. roots/list).
+            self._dispatch_inbound_request(
+                msg.get("method", ""), msg.get("params", {}), msg["id"]
+            )
+        elif "id" in msg:
             req_id = msg["id"]
             fut = self._pending_responses.pop(req_id, None)
             if fut and not fut.done():
@@ -673,7 +724,7 @@ class WebSocketTransport(MCPTransport):
                     ))
                 else:
                     fut.set_result(msg.get("result"))
-        elif "method" in msg and "id" not in msg:
+        elif "method" in msg:
             method = msg.get("method", "")
             params = msg.get("params", {})
             if self.on_notification:
