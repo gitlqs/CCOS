@@ -194,6 +194,21 @@ async def _execute_single(
         )
 
     if perm.decision == PermissionDecision.ASK:
+        # CRITICAL INVARIANT: ask_permission (which does blocking rich.console.input)
+        # may ONLY be called for the main REPL's PermissionManager, which is the
+        # only one with prompting_allowed=True. All sub-engines (Agent, forked
+        # skills, background memory extraction, etc.) receive a manager with
+        # prompting_allowed=False, which turns ASK into DENY in PermissionManager._finish_ask
+        # before we ever reach this line.
+        #
+        # If you ever see ask_permission being called while the main REPL is inside
+        # prompt_toolkit PromptSession.prompt() (showing the live ❯), it means a
+        # sub-engine was accidentally given the main interactive PermissionManager.
+        # That is a bug in engine/app wiring, not here.
+        #
+        # During a normal main turn, the PTK prompt is NOT active (we're between
+        # get_user_input calls, inside the engine run), so an interactive prompt
+        # here is safe and expected for main-agent tool uses that require approval.
         choice = ask_permission(tool, tc.input)
         if choice == "no":
             return ToolResultContent(

@@ -117,6 +117,20 @@ def get_user_input(
     """Get input from user. Returns None on Ctrl+D (EOF).
 
     Uses CC's ❯ prompt character with mode-dependent coloring.
+
+    This is the *only* place the main REPL blocks for user input at the
+    top-level prompt. While this call is active, the terminal is owned by
+    prompt_toolkit. No other code path may perform blocking terminal input
+    (rich.console.input, input(), etc.) while this is live.
+
+    The permission prompt path (ask_permission) is only reachable from the
+    main agent's tool execution *during* a QueryEngine.run_turn, which happens
+    *between* two get_user_input calls. At that point PTK does not own the
+    terminal for prompting, so a nested rich input is safe.
+
+    Background threads and sub-engines are deliberately given
+    PermissionManager instances with prompting_allowed=False so they can
+    never reach ask_permission at all.
     """
     try:
         prompt = _make_prompt(mode)

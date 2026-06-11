@@ -16,7 +16,34 @@ console = Console()
 def ask_permission(tool: Tool, params: dict[str, Any]) -> str:
     """Show a permission dialog and return user choice.
 
-    Returns one of: 'yes', 'no', 'always', 'deny_always'
+    Returns one of: 'yes', 'no', 'always', 'deny_always'.
+
+    CRITICAL ARCHITECTURAL INVARIANT:
+    This function performs a *blocking* terminal input via rich.console.input().
+    It may ONLY be called from the main REPL's tool execution path for the
+    primary (interactive) PermissionManager — i.e. only when the main agent
+    (the one whose turn is currently executing inside QueryEngine.run_turn
+    called from App.run_interactive / run_single) needs user approval for a
+    tool use.
+
+    At that moment the main REPL is *not* inside PromptSession.prompt() showing
+    the live ❯ prompt; it is inside the engine turn, between user input and
+    the next get_user_input call. Therefore a nested rich input here cannot
+    corrupt prompt_toolkit state.
+
+    For every other context (Agent tool sub-agents, forked skill execution,
+    background memory extraction threads, any other QueryEngine created via
+    _create_sub_engine or _create_memory_extraction_engine), the App wires a
+    PermissionManager with prompting_allowed=False. PermissionManager._finish_ask
+    converts any would-be ASK into a DENY before we ever reach ask_permission
+    in engine/tool_executor.py. Thus ask_permission is *never* called from those
+    contexts, and no rich input can race the live PTK ❯ prompt.
+
+    If you ever see permission prompts appearing *under* a live ❯, or the REPL
+    freezing after typing at a permission prompt while a ❯ is visible, it means
+    the invariant was violated: some background/sub-engine was accidentally
+    given the main interactive PermissionManager. That is a wiring bug in app.py
+    or the callers of PermissionManager, not a UI race in prompts.py.
     """
     # Build description of what the tool wants to do
     desc_parts: list[str] = [f"[bold]{tool.name}[/bold]"]

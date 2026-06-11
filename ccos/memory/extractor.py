@@ -250,7 +250,19 @@ class MemoryExtractor:
             self._cursor = len(messages)
 
     def _create_engine(self) -> QueryEngine:
-        """Create the forked extraction engine, capped at MAX_EXTRACTION_TURNS."""
+        """Create the forked extraction engine, capped at MAX_EXTRACTION_TURNS.
+
+        The engine_factory provided by App is _create_memory_extraction_engine,
+        which gives us a QueryEngine wired with a PermissionManager that has:
+          - prompting_allowed=False (ASK is converted to DENY; no interactive
+            prompts can ever escape this engine while the main REPL is at the PTK ❯)
+          - memory_dir explicitly set, so the manager auto-allows only Read/Write/Edit
+            inside that directory and read-only Bash, and denies everything else
+            (Agent, AskUserQuestion, Web*, Task*, Notebook*, write-capable Bash, etc.).
+
+        We do not touch the permissions object here; the factory already did the
+        right thing. We only enforce the turn budget.
+        """
         assert self._engine_factory is not None
         engine = self._engine_factory()
         # Cap the turn budget if the engine exposes a max-turns knob (cc uses

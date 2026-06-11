@@ -124,7 +124,11 @@ class AskUserQuestionTool(Tool):
     }
 
     def is_read_only(self, params: dict[str, Any]) -> bool:
-        return True  # Just asking a question, no side effects
+        # Interactive user questioning is NOT read-only from a permission
+        # perspective: it requires an interactive prompt and must be subject
+        # to the PermissionManager's ASK policy (which will turn into DENY for
+        # any non-main context via prompting_allowed=False).
+        return False
 
     async def execute(self, params: dict[str, Any], ctx: ToolContext) -> ToolOutput:
         questions = params.get("questions", [])

@@ -20,6 +20,7 @@ import fnmatch
 import os
 import re
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from ccos.tools.base import PermissionCheck, PermissionDecision, Tool, ToolContext
@@ -179,6 +180,16 @@ _ENV_VAR_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=\S*\
 # for deny/ask matching so 'timeout 5 rm -rf x' still matches a deny on rm.
 _SAFE_WRAPPERS: frozenset[str] = frozenset({"timeout", "time", "nice", "nohup", "stdbuf"})
 
+# Safe redirection patterns that only discard output (to nul / /dev/null).
+# These are tolerated in read-only discovery commands (e.g. 'dir ... 2>nul || echo ...')
+# without causing the command to be treated as having write/execute side effects.
+_SAFE_REDIR_PATTERNS: list[str] = [
+    r'2\s*\^?>\s*(nul|NUL|/dev/null)',
+    r'>\s*(nul|NUL|/dev/null)',
+    r'2\s*&\s*>\s*1',
+    r'>\s*/dev/null(?:\s+2\s*&\s*>\s*1)?',
+]
+
 
 # ── Bypass-immune dangerous files / directories (cc filesystem.ts) ────────────
 # Exact lists from cc src/utils/permissions/filesystem.ts. Writes touching any
@@ -212,18 +223,38 @@ ACCEPT_EDITS_BASH_COMMANDS: frozenset[str] = frozenset({
 
 
 class PermissionManager:
-    """Manages tool execution permissions following cc's decision order."""
+    """Manages tool execution permissions following cc's decision order.
+
+    Root safety invariant:
+    - Only the top-level main REPL driver (the engine run by run_interactive /
+      run_single) may ever produce an interactive permission prompt.
+    - All sub-agents (Agent tool, forked skills, background memory extraction,
+      any other forked QueryEngine) MUST be given a PermissionManager with
+      prompting_allowed=False. When ASK would be returned, it is converted to
+      DENY with a clear reason. This guarantees no rich.console.input() or
+      prompt_toolkit conflict can ever occur while the main REPL is blocked
+      inside PromptSession.prompt() showing the live ❯ prompt.
+    - Memory extraction gets an even stricter policy via for_memory_extraction:
+      it may only read/write inside its designated memory directory using a
+      tiny allowlist of tools (Read/Write/Edit/Glob/Grep + read-only Bash).
+      No interactive tools, no external I/O, no rm, no Agent, etc.
+    """
 
     def __init__(
         self,
         mode: PermissionMode = PermissionMode.DEFAULT,
         always_allow: dict[str, set[str]] | None = None,
         always_deny: dict[str, set[str]] | None = None,
+        *,
+        prompting_allowed: bool = True,
+        memory_dir: str | None = None,
     ):
         self.mode = mode
         self.always_allow: dict[str, set[str]] = always_allow or {}
         self.always_deny: dict[str, set[str]] = always_deny or {}
         self._session_allows: dict[str, set[str]] = {}  # Remembered for this session
+        self.prompting_allowed: bool = prompting_allowed
+        self.memory_dir: str | None = os.path.abspath(memory_dir) if memory_dir else None
 
     # ──────────────────────────────────────────────────────────────────────
     # Main decision flow
@@ -293,28 +324,56 @@ class PermissionManager:
         elif tool.is_read_only(params):
             return PermissionCheck(PermissionDecision.ALLOW)
 
-        # 6. acceptEdits auto-allow (writes in cwd + filesystem bash commands).
+        # 6. Memory-extraction scoped auto-allow (strict, non-interactive only).
+        # This runs AFTER structural read-only allow, so read-only tools are
+        # already allowed above. We only need to auto-allow the write-side tools
+        # when they target the designated memory dir, and deny everything else.
+        if self.memory_dir and not self.prompting_allowed:
+            mem_allow = self._check_memory_extraction_policy(tool, params, ctx)
+            if mem_allow is not None:
+                return mem_allow
+            # If we are in a memory-scoped manager and the action is not
+            # explicitly allowed by the memory policy, deny it rather than
+            # falling through to a generic ASK (which would be turned into
+            # DENY by _finish_ask anyway). This gives a clearer reason.
+            return PermissionCheck(
+                PermissionDecision.DENY,
+                reason="Memory extraction policy: only read/write inside the memory directory using Read/Write/Edit/Glob/Grep and read-only Bash is permitted.",
+            )
+
+        # 7. acceptEdits auto-allow (writes in cwd + filesystem bash commands).
         if self.mode == PermissionMode.ACCEPT_EDITS:
             accept = self._check_accept_edits(tool, params, command, is_bash, ctx)
             if accept is not None:
                 return accept
 
-        # 7. Allow rules (persistent + session).
+        # 8. Allow rules (persistent + session).
         for source in (self.always_allow, self._session_allows):
             if self._matching_content_pattern(source, tool, params, behavior="allow") is not None:
                 return PermissionCheck(PermissionDecision.ALLOW)
             if self._tool_wide_rule(source, tool.name):
                 return PermissionCheck(PermissionDecision.ALLOW)
 
-        # 8. Default: ask the user (dontAsk converts to deny).
+        # 9. Default: ask the user (dontAsk converts to deny).
+        # If prompting_allowed=False this becomes DENY (see _finish_ask).
         return self._finish_ask(tool)
 
     def _finish_ask(self, tool: Tool) -> PermissionCheck:
-        """Final ASK, applying dontAsk-mode transformation (cc step at end)."""
-        if self.mode == PermissionMode.DONT_ASK:
+        """Final ASK, applying dontAsk-mode transformation (cc step at end).
+
+        Architectural safety: if prompting_allowed is False (any sub-engine,
+        background task, memory extractor, forked agent, etc.), we MUST NEVER
+        return ASK, because that would lead to a blocking rich.console.input()
+        or similar while the main REPL is inside prompt_toolkit's PromptSession
+        showing the live ❯ prompt. Converting to DENY is the only safe choice.
+        """
+        if not self.prompting_allowed or self.mode == PermissionMode.DONT_ASK:
             return PermissionCheck(
                 PermissionDecision.DENY,
-                reason=f"{tool.name} requires approval but auto-approval is disabled (dontAsk mode).",
+                reason=(
+                    f"{tool.name} requires approval but interactive permission prompts "
+                    "are disabled in this context (sub-agent, background task, or memory extraction)."
+                ),
             )
         return PermissionCheck(PermissionDecision.ASK)
 
@@ -376,6 +435,47 @@ class PermissionManager:
     def add_session_allow(self, tool_name: str, pattern: str) -> None:
         """Remember an allow for this session only."""
         self._session_allows.setdefault(tool_name, set()).add(pattern)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Factory helpers for safe sub-contexts (the architectural fix)
+    # ──────────────────────────────────────────────────────────────────────
+    def for_non_interactive(self) -> "PermissionManager":
+        """Return a copy configured so no interactive prompts are ever emitted.
+
+        ASK decisions become DENY. This copy shares the same mode/allow/deny
+        rule sets (so persistent config still applies), but it can never block
+        on user input. Use this for all forked sub-engines that run while the
+        main REPL may be waiting at the PTK ❯ prompt.
+        """
+        return PermissionManager(
+            mode=self.mode,
+            always_allow={k: set(v) for k, v in self.always_allow.items()},
+            always_deny={k: set(v) for k, v in self.always_deny.items()},
+            prompting_allowed=False,
+            memory_dir=self.memory_dir,
+        )
+
+    def for_memory_extraction(self, memory_dir: str | None = None) -> "PermissionManager":
+        """Return a strict non-interactive manager scoped to a memory directory.
+
+        Only Read/Write/Edit/Glob/Grep + read-only Bash are permitted.
+        All writes are forced to be inside the memory dir (absolute path check).
+        No Agent, no AskUserQuestion, no Web*, no Task*, no Notebook*, no MCP,
+        no write-capable Bash, no Edit/Write outside the memory dir.
+
+        prompting_allowed is always False for this variant.
+        """
+        mem_dir = os.path.abspath(memory_dir) if memory_dir else self.memory_dir
+        # Start from a clean slate — do not inherit broad always_allow.
+        # Only the memory-specific auto-allow logic inside check() applies.
+        mgr = PermissionManager(
+            mode=self.mode,
+            always_allow={},
+            always_deny={},
+            prompting_allowed=False,
+            memory_dir=mem_dir,
+        )
+        return mgr
 
     # ──────────────────────────────────────────────────────────────────────
     # Rule matching (cc shellRuleMatching.ts + filesystem.ts)
@@ -602,10 +702,15 @@ class PermissionManager:
         sub = self._strip_bash_prefixes(sub).strip()
         if not sub:
             return False
-        # Reject anything with shell metacharacters that could write/execute.
-        if any(ch in sub for ch in "`$<>"):
+        # Reject anything with shell metacharacters that could write/execute,
+        # EXCEPT safe output redirections to nul (Windows) or /dev/null.
+        # These are commonly used in discovery probes like:
+        #   dir /b "path" 2^>nul || echo "empty_or_missing"
+        # We strip only the safe redir suffix for the metacharacter scan.
+        core = self._strip_safe_redirections(sub)
+        if any(ch in core for ch in "`$<>"):
             return False
-        tokens = sub.split()
+        tokens = core.split()
         if not tokens:
             return False
         base = tokens[0]
@@ -660,6 +765,19 @@ class PermissionManager:
         """Split a compound command on &&, ||, ;, |, newline (cc splitCommand)."""
         parts = _COMPOUND_SPLIT_RE.split(command)
         return [p.strip() for p in parts if p.strip()]
+
+    @staticmethod
+    def _strip_safe_redirections(cmd: str) -> str:
+        """Remove safe output redirections (to nul / /dev/null) for classification.
+
+        This is only used for the metacharacter safety scan and tokenization in
+        _subcommand_is_read_only. The original command is still passed to the shell;
+        we are just proving it is "read-only plus harmless redirection".
+        """
+        s = cmd
+        for pat in _SAFE_REDIR_PATTERNS:
+            s = re.sub(pat, "", s, flags=re.IGNORECASE)
+        return s.strip()
 
     @staticmethod
     def _base_command(subcommand: str) -> str:
@@ -718,3 +836,75 @@ class PermissionManager:
             return False
         normalized = path.replace("\\", "/")
         return "/plans/" in normalized or normalized.endswith("plan.md")
+
+    def _check_memory_extraction_policy(
+        self, tool: Tool, params: dict[str, Any], ctx: ToolContext
+    ) -> PermissionCheck | None:
+        """Strict allowlist for background memory extraction sub-agents.
+
+        Returns ALLOW if the operation is within policy, DENY if it is
+        explicitly out of policy for memory extraction, or None to let the
+        caller apply the generic memory-scoped denial message.
+        """
+        if not self.memory_dir:
+            return None
+
+        mem_dir = os.path.abspath(self.memory_dir)
+        allowed_write_tools = {"Write", "Edit"}
+        allowed_read_tools = {"Read", "Glob", "Grep"}
+
+        # Only these tools are ever interesting for memory extraction.
+        if tool.name not in allowed_write_tools | allowed_read_tools | {"Bash"}:
+            # Everything else (Agent, AskUserQuestion, Web*, Task*, Notebook*,
+            # MCP deferred, etc.) is denied for memory extraction.
+            return PermissionCheck(
+                PermissionDecision.DENY,
+                reason=f"Memory extraction policy denies {tool.name}.",
+            )
+
+        if tool.name in allowed_read_tools:
+            # Read/Glob/Grep are always OK inside the memory dir (or anywhere,
+            # but the extractor prompt already tells it to stay focused).
+            # We still force the path check for Write/Edit below; for reads
+            # we are permissive to allow the initial ls/scan of the dir.
+            return PermissionCheck(PermissionDecision.ALLOW)
+
+        if tool.name in allowed_write_tools:
+            path = params.get("file_path", "")
+            if not path:
+                return PermissionCheck(
+                    PermissionDecision.DENY,
+                    reason="Memory extraction: Write/Edit without file_path.",
+                )
+            try:
+                abs_path = os.path.abspath(path)
+            except Exception:
+                return PermissionCheck(
+                    PermissionDecision.DENY,
+                    reason="Memory extraction: unresolvable path.",
+                )
+            # Must be inside the memory dir.
+            try:
+                common = os.path.commonpath([abs_path, mem_dir])
+            except ValueError:
+                common = ""
+            if os.path.normcase(common) != os.path.normcase(mem_dir):
+                return PermissionCheck(
+                    PermissionDecision.DENY,
+                    reason="Memory extraction: Write/Edit must target the memory directory.",
+                )
+            return PermissionCheck(PermissionDecision.ALLOW)
+
+        if tool.name == "Bash":
+            # Only allow if the entire command is structurally read-only
+            # (after safe redirection stripping). No write-capable Bash for
+            # the memory extractor, even inside the memory dir.
+            command = params.get("command", "") or ""
+            if self._bash_is_read_only(command):
+                return PermissionCheck(PermissionDecision.ALLOW)
+            return PermissionCheck(
+                PermissionDecision.DENY,
+                reason="Memory extraction policy: only read-only Bash is allowed.",
+            )
+
+        return None

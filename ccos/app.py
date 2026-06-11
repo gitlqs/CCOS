@@ -194,10 +194,13 @@ class App:
             mcp_instructions_provider=self._get_mcp_instructions,
         )
 
-        # Wire memory extractor's engine factory
-        self.memory_extractor._engine_factory = self._create_sub_engine
+        # Wire memory extractor's engine factory to a *strictly scoped non-interactive*
+        # engine. Memory extraction runs in a background thread after a main turn
+        # has completed and the REPL may be blocked inside prompt_toolkit showing
+        # the live ❯ prompt. It must never emit an interactive permission prompt.
+        self.memory_extractor._engine_factory = self._create_memory_extraction_engine
 
-        # Wire skill executor's engine factory
+        # Wire skill executor's engine factory for forked skills (also non-interactive).
         self.skill_executor._engine_factory = self._create_sub_engine
 
         # Commands
@@ -337,13 +340,35 @@ class App:
                     self.session_manager.save_user_message(user_input)
 
                     # Run through the engine
+                    # IMPORTANT TIMING INVARIANT:
+                    # - get_user_input above owns the PTK prompt (❯ is live).
+                    # - Once we call _async_turn / run_turn, PTK is no longer prompting;
+                    #   the main thread owns the terminal for the duration of the turn.
+                    # - Inside that turn, main-agent tool uses that require approval
+                    #   may legitimately call ask_permission (rich input) — this is safe
+                    #   because PTK is not in prompt mode.
+                    # - After the turn returns (and we flush + print the blank line),
+                    #   we fire _maybe_extract_memories which spawns a *background thread*
+                    #   running a memory-scoped, non-interactive QueryEngine. That engine
+                    #   has a PermissionManager with prompting_allowed=False and an
+                    #   explicit memory_dir; it can never call ask_permission.
+                    # - Only after _maybe_extract_memories returns (or the thread has
+                    #   been kicked off) do we loop back to get_user_input.
+                    #
+                    # The combination of:
+                    #   (a) non-interactive PermissionManager copies for all sub-engines,
+                    #   (b) memory-dir strict scoping for the extractor,
+                    #   (c) the turn-vs-prompt timing above,
+                    # guarantees that no permission prompt UI can ever appear while a
+                    # live PTK ❯ prompt is displayed, and therefore no input-system
+                    # collision or "prompt under prompt + hang" can occur.
                     try:
                         result = self._run_async(self._async_turn(user_input))
                         self.renderer.flush_streaming()
                         self.console.print()  # Add an empty line before next prompt
                         # Persist assistant response
                         self._persist_last_assistant()
-                        # Background memory extraction
+                        # Background memory extraction (fire-and-forget thread, non-interactive perms)
                         self._maybe_extract_memories()
                     except KeyboardInterrupt:
                         self.renderer.flush_streaming()
@@ -483,7 +508,24 @@ class App:
             self.session_manager.save_assistant_message(serialized, self.model)
 
     def _maybe_extract_memories(self) -> None:
-        """Check if background memory extraction should run after this turn."""
+        """Check if background memory extraction should run after this turn.
+
+        This is deliberately kicked off *after* the main turn has completed and
+        the blank line has been printed, but *before* we return to get_user_input.
+        The extractor runs in a daemon thread with its own event loop and a
+        QueryEngine created by _create_memory_extraction_engine.
+
+        That engine is wired with a PermissionManager that has:
+          prompting_allowed=False  → ASK is converted to DENY, no ask_permission ever called
+          memory_dir=...           → only Read/Write/Edit inside the memory dir + read-only Bash
+                                     are auto-allowed; everything else (Agent, AskUserQuestion,
+                                     Web*, Task*, Notebook*, write-capable Bash, MCP, etc.) is
+                                     denied at the PermissionManager level.
+
+        This is the final link in the chain that eliminates the original bug:
+        "model finished, user sees ❯, but permission prompts for memory writes + dir probes
+         keep appearing under it and then the terminal hangs."
+        """
         try:
             messages = self.engine.messages.messages
             # Check if main agent wrote to memory dir this turn
@@ -523,18 +565,65 @@ class App:
             # Full message restoration would need content block deserialization
 
     def _create_sub_engine(self, model_override: str = "") -> QueryEngine:
-        """Factory for creating sub-agent QueryEngine instances."""
+        """Factory for creating sub-agent QueryEngine instances.
+
+        All sub-engines (Agent tool, forked skills, etc.) that may run while the
+        main REPL is blocked at the PTK ❯ prompt MUST receive a non-interactive
+        PermissionManager. We hand them a copy with prompting_allowed=False via
+        PermissionManager.for_non_interactive(). This is the central point that
+        enforces the "only the main REPL may ever ask the user for permission"
+        architectural rule.
+        """
         model = model_override or self.model
+        sub_permissions = self.permissions.for_non_interactive()
+        # Defensive invariant check: sub-engines must never receive a manager that
+        # can emit interactive prompts while the main REPL may be at the PTK ❯.
+        assert sub_permissions.prompting_allowed is False, \
+            "Sub-engine must be given a non-interactive PermissionManager"
         return QueryEngine(
             provider=self.provider,
             model=model,
             tools=self.tool_registry,
             prompt_builder=PromptBuilder(),
-            permissions=self.permissions,
+            permissions=sub_permissions,
             ctx=self.ctx,  # shared context (read_files, background_tasks)
             cost_tracker=self.engine.cost,  # shared cost tracker
             console=self.console,
             on_text=lambda t: None,  # sub-agents don't stream to UI
+            on_tool_start=None,
+            on_tool_end=None,
+            on_thinking=None,
+            mcp_instructions_provider=self._get_mcp_instructions,
+        )
+
+    def _create_memory_extraction_engine(self, model_override: str = "") -> QueryEngine:
+        """Factory for the background memory extraction sub-engine.
+
+        This is stricter than a generic sub-engine:
+        - prompting_allowed=False (via for_memory_extraction)
+        - memory_dir is explicitly passed so the PermissionManager can auto-allow
+          Read/Write/Edit only inside that directory and deny everything else
+          (no Agent, no AskUserQuestion, no Web*, no write-capable Bash, etc.).
+        - The engine is still capped at a small turn budget by MemoryExtractor.
+        """
+        model = model_override or self.model
+        mem_dir = str(self.memory_store.memory_dir)
+        mem_permissions = self.permissions.for_memory_extraction(mem_dir)
+        # Defensive invariant check for the strictest case (memory extraction).
+        assert mem_permissions.prompting_allowed is False, \
+            "Memory extraction engine must be given a non-interactive PermissionManager"
+        assert mem_permissions.memory_dir is not None, \
+            "Memory extraction engine must be given an explicit memory_dir"
+        return QueryEngine(
+            provider=self.provider,
+            model=model,
+            tools=self.tool_registry,
+            prompt_builder=PromptBuilder(),
+            permissions=mem_permissions,
+            ctx=self.ctx,
+            cost_tracker=self.engine.cost,
+            console=self.console,
+            on_text=lambda t: None,
             on_tool_start=None,
             on_tool_end=None,
             on_thinking=None,
